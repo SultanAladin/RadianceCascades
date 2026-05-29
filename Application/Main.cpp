@@ -28,11 +28,16 @@
 #include "Shadow/PCSSShadow.h"
 #include "Shadow/VSMShadow.h"
 #include "Shadow/SDFConeShadow.h"
+#include "GI/IGIAlgorithm.h"
+#include "GI/SDFGI.h"
+#include "GI/RadianceCascadeGI.h"
+#include "RS/RenderSettings.h"
 #include "SDF/GlobalSDF.h"
 #include "Material/MaterialSeed.h"
 #include "Scene/SceneInternal.h"
 #include "UI/ImGuiContextRS.h"
 #include "UI/ImGuiPanel.h"
+#include "UI/RenderSettingsPanel.h"
 #include "UI/SdfBakerPanel.h"
 #include "imgui.h"
 
@@ -365,6 +370,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         return 10;
     }
 
+    // Phase 14a groundwork: master RenderSettings owned by the host; GI algo
+    // is hot-swappable via the Render Settings panel combo. Both algos are
+    // stubs at this point (no compute work) — the wiring is what unlocks
+    // 14b/14c (insert pass, RC trace, merge).
+    RS::RenderSettings renderSettings;
+    auto makeGiAlgo = [&renderSettings](RS::GIAlgorithmKind kind)
+        -> std::unique_ptr<RS::IGIAlgorithm> {
+        switch (kind) {
+            case RS::GIAlgorithmKind::RadianceCascades: {
+                auto p = std::make_unique<RS::RadianceCascadeGI>();
+                p->SetSettings(&renderSettings.GI);
+                return p;
+            }
+            case RS::GIAlgorithmKind::SDFGI:
+            default:
+                return std::make_unique<RS::SDFGI>();
+        }
+    };
+    std::unique_ptr<RS::IGIAlgorithm> gi = makeGiAlgo(renderSettings.GI.Algorithm);
+    gi->Initialize(vk, globalSdf);
+
     RS::Renderer renderer;
     RS::InitDesc rd{};
     rd.Instance            = vk.Instance;
@@ -516,6 +542,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         };
         if (sdfResidencyChanged) pushSdfToConsumers();
 
+        // Phase 14a: Render Settings panel — master GI toggle + algo combo.
+        // Returns the requested algo variant (0/1) if the combo changed,
+        // -1 otherwise. Hot-swap mirrors the shadow path below.
+        const int requestedGiSwap = RS::DrawRenderSettingsPanel(renderSettings, gi.get());
+        if (requestedGiSwap >= 0) {
+            vkDeviceWaitIdle(vk.Device);
+            gi->Terminate();
+            renderSettings.GI.Algorithm = static_cast<RS::GIAlgorithmKind>(requestedGiSwap);
+            gi = makeGiAlgo(renderSettings.GI.Algorithm);
+            gi->Initialize(vk, globalSdf);
+            RS_LOG_INFO("GI algo swapped to %s", gi->Name());
+        }
+
         const int requestedShadowSwap = DrawShadowsPanel(*shadow);
         if (requestedShadowSwap >= 0) {
             // Hot-swap algo: tear down old, build new, then rebuild the
@@ -615,6 +654,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         frameCtx.RenderExtent = vk.SwapchainExtent;
         shadow->RecordShadowPass(frame.Cmd, frameCtx);
 
+        // Phase 14a: GI pre-frame (probe relight / hash insert) + gather. Both
+        // are no-ops on the current stubs; the call sites are here so the
+        // 14b/14c shader work plugs in without touching Main.cpp.
+        if (renderSettings.GI.Enabled) {
+            gi->RecordPreFrame(frame.Cmd, frameCtx);
+            gi->RecordGather  (frame.Cmd, frameCtx);
+        }
+
         RS::LightingPassRecord(lighting, vk, frame.Cmd, frame.FrameSlot, targets,
                                *shadow, view, previewSettings.SunDirection,
                                glm::vec3(1.0f), previewSettings.SunIntensity,
@@ -632,6 +679,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RS::SdfBakerTerminate     (sdfBaker, vk);
     RS::SceneDetachVulkan(scene);
     RS::LightingPassTerminate (lighting, vk);
+    gi->Terminate();
+    gi.reset();
     shadow->Terminate         (vk);
     shadow.reset();
     RS::PickingTerminate(picking, vk);

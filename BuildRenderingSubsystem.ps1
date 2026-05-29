@@ -287,6 +287,7 @@ try {
         "Source\Shadow\VSMShadow.cpp",
         "Source\Shadow\SDFConeShadow.cpp",
         "Source\GI\SDFGI.cpp",
+        "Source\GI\RadianceCascadeGI.cpp",
         "Source\GI\ProbeDebug.cpp",
         "Source\SDF\MeshSDFBaker.cpp",
         "Source\SDF\GlobalSDF.cpp",
@@ -303,6 +304,7 @@ try {
         "Source\UI\ImGuiPanel.cpp",
         "Source\UI\ImGuiContextRS.cpp",
         "Source\UI\PerfWidget.cpp",
+        "Source\UI\RenderSettingsPanel.cpp",
         "Source\UI\SdfBakerPanel.cpp"
     )
     $imguiSourceRelPaths = @(

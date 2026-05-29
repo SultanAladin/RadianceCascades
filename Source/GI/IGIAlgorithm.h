@@ -9,7 +9,7 @@ namespace RS {
 
 struct VulkanContext;
 struct FrameContext;
-class  GlobalSDF;
+struct GlobalSDF;
 
 struct IGIAlgorithm {
     virtual ~IGIAlgorithm() = default;
