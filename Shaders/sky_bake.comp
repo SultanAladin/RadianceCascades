@@ -1,0 +1,71 @@
+#version 450
+// Phase 8 — Sky cubemap baker.
+// Procedural 3-band gradient (zenith, horizon, ground) + soft sun disc. Writes
+// every face/pixel of the sky cubemap. Faces are addressed via a 2D-array image
+// view (6 layers); the face index is gl_GlobalInvocationID.z.
+//
+// Dispatch:  ceil(size/8) x ceil(size/8) x 6   with local_size 8x8x1.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly imageCube uSky;
+
+layout(push_constant) uniform Push {
+    vec4 ZenithIntensity;   // rgb = zenith colour, a = sky intensity multiplier
+    vec4 Horizon;           // rgb = horizon colour, a = horizon softness exponent
+    vec4 Ground;            // rgb = ground colour,  a = ground softness exponent
+    vec4 SunDirSize;        // xyz = sun direction (toward sun, normalised), w = angular size (radians)
+    vec4 SunColor;          // rgb = sun radiance,   a = sun intensity multiplier
+    vec4 FaceSize;          // x = face size (texels), yzw = unused
+} pc;
+
+// Map a 2D pixel coordinate + face index to a direction on the unit sphere.
+// Standard Vulkan cube face ordering (Khronos):
+//   0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z
+vec3 CubeDir(uint face, vec2 uv) {
+    // uv in [0,1] — convert to NDC in [-1,1] with +Y down inside each face,
+    // matching the Vulkan cube sample direction convention so imageStore +
+    // textureSample agree.
+    vec2 n = uv * 2.0 - 1.0;
+    vec3 d;
+    if      (face == 0u) d = vec3( 1.0, -n.y, -n.x); // +X
+    else if (face == 1u) d = vec3(-1.0, -n.y,  n.x); // -X
+    else if (face == 2u) d = vec3( n.x,  1.0,  n.y); // +Y
+    else if (face == 3u) d = vec3( n.x, -1.0, -n.y); // -Y
+    else if (face == 4u) d = vec3( n.x, -n.y,  1.0); // +Z
+    else                 d = vec3(-n.x, -n.y, -1.0); // -Z
+    return normalize(d);
+}
+
+void main() {
+    uint  face = gl_GlobalInvocationID.z;
+    uvec2 px   = gl_GlobalInvocationID.xy;
+    float size = pc.FaceSize.x;
+    if (px.x >= uint(size) || px.y >= uint(size) || face >= 6u) return;
+
+    vec2 uv  = (vec2(px) + 0.5) / size;
+    vec3 dir = CubeDir(face, uv);
+
+    // Vertical band: dir.y in [-1, +1].
+    //   y > 0  : sky (mix horizon → zenith via horizonExp curve)
+    //   y < 0  : ground (mix horizon → ground via groundExp curve)
+    float upT   = pow(clamp( dir.y, 0.0, 1.0), max(pc.Horizon.a, 0.05));
+    float downT = pow(clamp(-dir.y, 0.0, 1.0), max(pc.Ground.a,  0.05));
+
+    vec3 sky    = mix(pc.Horizon.rgb, pc.ZenithIntensity.rgb, upT);
+    vec3 ground = mix(pc.Horizon.rgb, pc.Ground.rgb,           downT);
+    vec3 col    = (dir.y >= 0.0) ? sky : ground;
+    col *= pc.ZenithIntensity.a;
+
+    // Soft sun disc. Aperture is the half-angle; falloff smoothes the edge by
+    // 0.5° so 1-sample relight integration doesn't alias to all-black.
+    vec3  sunDir   = normalize(pc.SunDirSize.xyz);
+    float cosAng   = clamp(dot(dir, sunDir), -1.0, 1.0);
+    float aperture = max(pc.SunDirSize.w, 0.001);
+    float cosAper  = cos(aperture);
+    float cosEdge  = cos(aperture + 0.0087);
+    float sunMask  = smoothstep(cosEdge, cosAper, cosAng);
+    col += pc.SunColor.rgb * pc.SunColor.a * sunMask * max(dir.y, 0.0);
+
+    imageStore(uSky, ivec3(ivec2(px), int(face)), vec4(col, 1.0));
+}

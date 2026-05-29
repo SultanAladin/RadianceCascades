@@ -1,0 +1,35 @@
+# Build outputs
+Artifacts/
+BuildArtifacts/
+obj-adaptive/
+Logs/
+*.exe
+*.lib
+*.pdb
+*.exp
+*.obj
+*.ilk
+*.idb
+*.dll
+imgui.ini
+build_log.txt
+rs_stderr*.log
+rs_stdout*.log
+stderr.log
+stdout.log
+*.log
+
+# Editor / IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.aps
+
+# OS junk
+Thumbs.db
+Desktop.ini
+
+# Docs (design notes, HTML, Python harness)
+Docs/
+*.html

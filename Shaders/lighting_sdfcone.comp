@@ -1,0 +1,235 @@
+#version 450
+// Phase 13 lighting compose — SDFCone variant. Same Karis/Schlick/Smith path as
+// lighting.comp, but the shadow factor comes from a sphere-traced soft shadow
+// against the resident mesh SDF.
+//
+// Algorithm: improved Iñigo Quilez soft-shadow, h*h/(2*y) penumbra tracking.
+//   ref: https://iquilezles.org/articles/rmshadows/
+// Classic (k*h/t) bands at grazing angles because it ignores the previous
+// step's distance; the y-form fixes that and gives a more physically plausible
+// penumbra width that ramps with cone-angle × distance.
+//
+// Descriptor contract (set=2 for variant 3):
+//   binding 0 = sampler3D R16_SNORM (resident mesh SDF — dummy 1^3 fallback)
+//   binding 1 = AlgoUbo (80 bytes — sun, AABB, decode scale, trace params)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ----------------------- set=1 GBuffer + IBL + output ------------------------
+layout(set = 1, binding = 0) uniform sampler2D    uAlbedo;
+layout(set = 1, binding = 1) uniform sampler2D    uNormal;
+layout(set = 1, binding = 2) uniform sampler2D    uRMF;
+layout(set = 1, binding = 3) uniform sampler2D    uEmissive;
+layout(set = 1, binding = 4) uniform sampler2D    uDepth;
+layout(set = 1, binding = 5) uniform usampler2D   uIdentity;
+layout(set = 1, binding = 6) uniform samplerCube  uIrradiance;
+layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
+layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
+layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
+
+// ----------------------- set=2 SDFCone shadow contract -----------------------
+layout(set = 2, binding = 0) uniform sampler3D uMeshSDF;
+layout(set = 2, binding = 1) uniform AlgoUbo {
+    vec4 SunDirAndHalfAngle;     // xyz = direction TOWARD sun, w = half-angle (rad)
+    vec4 AABBMinAndMaxDist;      // xyz = AABB min,  w = R16_SNORM decode scale
+    vec4 AABBMaxAndSurfaceOff;   // xyz = AABB max,  w = surface offset along N
+    vec4 TraceParams;            // x = maxSteps, y = maxDistance, z = minStep, w = strength
+    vec4 Flags;                  // x = enabled, y = hasSDF
+} ualgo;
+
+// ----------------------- push constants --------------------------------------
+layout(push_constant) uniform Push {
+    mat4 InvViewProj;
+    vec4 EyePosWorld;            // xyz = eye, w = ambient
+    vec4 SunDirAndIntensity;     // xyz = direction TOWARD sun, w = intensity
+    vec4 SunColor;
+    vec4 IblParams;              // x = on/off, y = intensity, z = prefilter mip count
+    vec4 ResAndFlags;            // x = width, y = height
+} pc;
+
+// ----------------------- BRDF helpers ----------------------------------------
+
+const float kPI = 3.14159265359;
+
+float D_GGX(float NdotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float d = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / (kPI * d * d + 1e-5);
+}
+
+float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
+    float a = roughness * roughness;
+    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
+    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
+    return 0.5 / max(ggxV + ggxL, 1e-5);
+}
+
+vec3 F_Schlick(float VdotH, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
+    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// ----------------------- SDF helpers -----------------------------------------
+
+// Sample the SDF at a world-space point. The image is R16_SNORM in [-1, 1];
+// multiply by MaxDist to get the signed distance in world units.
+float SampleSDF(vec3 worldPos) {
+    vec3 aabbMin = ualgo.AABBMinAndMaxDist.xyz;
+    vec3 aabbMax = ualgo.AABBMaxAndSurfaceOff.xyz;
+    vec3 boxSize = max(aabbMax - aabbMin, vec3(1e-6));
+    vec3 uvw     = (worldPos - aabbMin) / boxSize;
+    // Outside the SDF box → no occluder. Return a large positive distance so
+    // the sphere-trace bails out cleanly.
+    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) {
+        return 1e6;
+    }
+    float snorm = texture(uMeshSDF, uvw).r;
+    return snorm * ualgo.AABBMinAndMaxDist.w;
+}
+
+// Conservative slab intersection — returns the world-space distance to enter
+// the SDF box from a ray (ro, rd). Negative if ray origin is already inside.
+// rd MUST be normalized.
+float RayBoxEnter(vec3 ro, vec3 rd) {
+    vec3 aabbMin = ualgo.AABBMinAndMaxDist.xyz;
+    vec3 aabbMax = ualgo.AABBMaxAndSurfaceOff.xyz;
+    vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6)) * sign(rd);
+    vec3 t1 = (aabbMin - ro) * invRd;
+    vec3 t2 = (aabbMax - ro) * invRd;
+    vec3 tmin = min(t1, t2);
+    vec3 tmax = max(t1, t2);
+    float tEnter = max(tmin.x, max(tmin.y, tmin.z));
+    float tExit  = min(tmax.x, min(tmax.y, tmax.z));
+    if (tExit < 0.0 || tEnter > tExit) return -1.0;   // miss
+    return tEnter;
+}
+
+// Improved Iñigo Quilez soft-shadow sphere-trace. Returns visibility in
+// [0, 1]: 1.0 = fully lit, 0.0 = fully shadowed. The half-angle `k` is the
+// cone's slope (penumbra tightness — smaller = sharper edge).
+//   res = min(res, h*h / (2*y))
+// where h is the current SDF distance and y is the previous step's distance.
+// Mathematically equivalent to projecting the closest-approach ratio onto a
+// cone of half-angle k; the form above is the numerically stable one.
+float SoftShadowSDF(vec3 ro, vec3 rd, float maxDist, float k) {
+    int   maxSteps = int(clamp(ualgo.TraceParams.x, 1.0, 256.0));
+    float minStep  = max(ualgo.TraceParams.z, 1e-4);
+
+    // Skip empty space outside the SDF box.
+    float tEnter = RayBoxEnter(ro, rd);
+    float t      = max(0.0, tEnter);
+    if (t > maxDist) return 1.0;   // box ends before max distance
+
+    float res = 1.0;
+    float ph  = 1e10;              // previous step's distance (y in the formula)
+
+    for (int i = 0; i < maxSteps; ++i) {
+        if (t > maxDist) break;
+        float h = SampleSDF(ro + rd * t);
+        if (h < 0.001) {
+            // Hit the surface — fully shadowed.
+            return 0.0;
+        }
+        // Improved Quilez: h*h / (2*y) instead of k*h/t.
+        float y = h * h / (2.0 * ph);
+        float d = sqrt(max(h * h - y * y, 0.0));
+        res = min(res, d / max(k * (t - y), 1e-4));
+        ph  = h;
+        t  += max(h, minStep);
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+// ----------------------- main ------------------------------------------------
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(pc.ResAndFlags.xy);
+    if (px.x >= res.x || px.y >= res.y) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(res);
+
+    float depth = texture(uDepth, uv).r;
+    if (depth >= 1.0) {
+        imageStore(uLightHDR, px, vec4(0.0));
+        return;
+    }
+
+    vec3  albedo  = texture(uAlbedo,   uv).rgb;
+    vec3  encN    = texture(uNormal,   uv).rgb;
+    vec3  rmf     = texture(uRMF,      uv).rgb;
+    vec3  emiss   = texture(uEmissive, uv).rgb;
+
+    vec3  N         = normalize(encN * 2.0 - 1.0);
+    float roughness = max(rmf.r, 0.04);
+    float metallic  = rmf.g;
+    float F0Scalar  = rmf.b;
+
+    vec4 ndc       = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 worldH    = pc.InvViewProj * ndc;
+    vec3 worldPos  = worldH.xyz / worldH.w;
+    vec3 V         = normalize(pc.EyePosWorld.xyz - worldPos);
+
+    vec3  L     = normalize(pc.SunDirAndIntensity.xyz);
+    vec3  H     = normalize(L + V);
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 1e-3);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    float D  = D_GGX(NdotH, roughness);
+    float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
+    vec3  F  = F_Schlick(VdotH, F0);
+    vec3 specular = D * Vt * F;
+    vec3 kS       = F;
+    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
+    vec3 diffuse  = kD * albedo / kPI;
+
+    // Shadow factor via SDF cone trace.
+    float shadow = 1.0;
+    bool tracingOn = (ualgo.Flags.x > 0.5) && (ualgo.Flags.y > 0.5) && NdotL > 0.0;
+    if (tracingOn) {
+        // Step off the surface along N so the very first sample doesn't read
+        // the iso-band right under the receiver. The trace direction is L
+        // (toward the sun), not the algo UBO's sun (those agree to within
+        // float precision but the push-constant value is canonical).
+        vec3 ro = worldPos + N * ualgo.AABBMaxAndSurfaceOff.w;
+        // Cone half-angle is in radians; tan(angle) gives the slope k used in
+        // the soft-shadow formula. Small-angle approximation is plenty.
+        float k = max(tan(ualgo.SunDirAndHalfAngle.w), 1e-4);
+        float vis = SoftShadowSDF(ro, L,
+                                  ualgo.TraceParams.y,    // maxDist
+                                  k);
+        // Strength blends the trace result with full-lit (1.0). Strength=1 →
+        // pure trace, Strength=0 → no shadow.
+        shadow = mix(1.0, vis, clamp(ualgo.TraceParams.w, 0.0, 1.0));
+    }
+
+    vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;
+    vec3 lit = (diffuse + specular) * sunRadiance * NdotL * shadow;
+
+    // IBL split-sum.
+    vec3 ambient;
+    if (pc.IblParams.x >= 0.5) {
+        vec3  R         = reflect(-V, N);
+        vec3  irr       = texture(uIrradiance, N).rgb;
+        vec3  Fr        = F_SchlickRoughness(NdotV, F0, roughness);
+        vec3  kD_ibl    = (vec3(1.0) - Fr) * (1.0 - metallic);
+        float mipCount  = max(pc.IblParams.z - 1.0, 0.0);
+        vec3  prefilt   = textureLod(uPrefilter, R, roughness * mipCount).rgb;
+        vec2  brdf      = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
+        vec3  specIBL   = prefilt * (Fr * brdf.x + brdf.y);
+        ambient = (kD_ibl * irr * albedo + specIBL) * pc.IblParams.y;
+    } else {
+        ambient = albedo * pc.EyePosWorld.w;
+    }
+
+    vec3 result = lit + ambient + emiss;
+    imageStore(uLightHDR, px, vec4(result, 1.0));
+}

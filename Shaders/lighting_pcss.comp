@@ -1,0 +1,197 @@
+#version 450
+// Phase 11 PCSS variant of the lighting compose. Same set=1 / set=0 / set=3
+// contract as lighting.comp; set=2 layout differs (adds binding 2: non-compare
+// sampler2DArray for blocker search). Replaces the variant=0 PCF filter with a
+// 3-step PCSS: blocker search → penumbra estimate → wide PCF.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ----------------------- set=1 GBuffer + IBL + output ------------------------
+layout(set = 1, binding = 0) uniform sampler2D    uAlbedo;
+layout(set = 1, binding = 1) uniform sampler2D    uNormal;
+layout(set = 1, binding = 2) uniform sampler2D    uRMF;
+layout(set = 1, binding = 3) uniform sampler2D    uEmissive;
+layout(set = 1, binding = 4) uniform sampler2D    uDepth;
+layout(set = 1, binding = 5) uniform usampler2D   uIdentity;
+layout(set = 1, binding = 6) uniform samplerCube  uIrradiance;
+layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
+layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
+layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
+
+// ----------------------- set=2 PCSS contract ---------------------------------
+layout(set = 2, binding = 0) uniform sampler2DArrayShadow uShadowAtlas;       // compare-LESS, for PCF taps
+layout(set = 2, binding = 1) uniform AlgoUbo {
+    mat4 CascadeViewProj[4];
+    vec4 CascadeSplits;
+    vec4 PCSSParams;     // x = LightSizeUv (also gates: 0 → disabled), y = depthBias, z = normalBias, w = minPenumbraTexels
+    vec4 AtlasParams;    // x = 1/cascadeSize, y = cascadeSize, z = cascadeCount, w = packed (blocker | pcf<<16)
+} ualgo;
+layout(set = 2, binding = 2) uniform sampler2DArray uShadowAtlasRaw;          // non-compare, raw depth reads
+
+// ----------------------- push constants --------------------------------------
+layout(push_constant) uniform Push {
+    mat4 InvViewProj;
+    vec4 EyePosWorld;
+    vec4 SunDirAndIntensity;
+    vec4 SunColor;
+    vec4 IblParams;
+    vec4 ResAndFlags;
+} pc;
+
+const float kPI = 3.14159265359;
+
+float D_GGX(float NdotH, float roughness) {
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / (kPI * d * d + 1e-5);
+}
+float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
+    float a    = roughness * roughness;
+    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
+    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
+    return 0.5 / max(ggxV + ggxL, 1e-5);
+}
+vec3 F_Schlick(float VdotH, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
+    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Vogel disk — 32 deterministic sample directions on a unit disk.
+vec2 VogelDisk(int i, int n, float phi) {
+    float r     = sqrt((float(i) + 0.5) / float(n));
+    float theta = float(i) * 2.4 + phi;   // golden-angle ≈ 137.5°; 2.4 rad ≈ 137.5°
+    return vec2(cos(theta), sin(theta)) * r;
+}
+
+// Hash → interleaved gradient noise (good distribution per pixel).
+float IGN(vec2 px) {
+    return fract(52.9829189 * fract(0.06711056 * px.x + 0.00583715 * px.y));
+}
+
+float SamplePcssShadow(vec3 worldPos, vec3 worldN, float linearViewDepth, vec2 px) {
+    float lightSizeUv = ualgo.PCSSParams.x;
+    if (lightSizeUv <= 0.00001) return 1.0;   // disabled
+
+    int cascade = 3;
+    for (int c = 0; c < 4; ++c) {
+        if (linearViewDepth < ualgo.CascadeSplits[c]) { cascade = c; break; }
+    }
+
+    vec3 biasedPos = worldPos + worldN * ualgo.PCSSParams.z;
+    vec4 lsPos = ualgo.CascadeViewProj[cascade] * vec4(biasedPos, 1.0);
+    if (lsPos.w <= 0.0) return 1.0;
+    vec3 ndc = lsPos.xyz / lsPos.w;
+    vec2 uv  = ndc.xy * 0.5 + 0.5;
+    float receiverZ = ndc.z - ualgo.PCSSParams.y;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    if (receiverZ < 0.0 || receiverZ > 1.0) return 1.0;
+
+    uint packed         = floatBitsToUint(ualgo.AtlasParams.w);
+    int  blockerSamples = int(packed & 0xFFFFu);
+    int  pcfSamples     = int(packed >> 16);
+    float texel         = ualgo.AtlasParams.x;
+    float minPenumbra   = ualgo.PCSSParams.w;
+
+    float phi = IGN(px) * 6.2831853;
+
+    // 1) Blocker search — average depth of taps closer to light than receiver.
+    float avgBlocker  = 0.0;
+    float blockerSum  = 0.0;
+    float searchRadius = lightSizeUv;
+    for (int i = 0; i < blockerSamples; ++i) {
+        vec2 off = VogelDisk(i, blockerSamples, phi) * searchRadius;
+        float d  = texture(uShadowAtlasRaw, vec3(uv + off, float(cascade))).r;
+        if (d < receiverZ) {
+            avgBlocker += d;
+            blockerSum += 1.0;
+        }
+    }
+    if (blockerSum < 0.5) return 1.0;   // no blockers found → fully lit
+    avgBlocker /= blockerSum;
+
+    // 2) Penumbra estimate. Distance receiver→blocker in light-space scales the
+    //    cone radius. Clamp to a minimum texel-radius so we don't alias hard
+    //    contact shadows.
+    float penumbra = (receiverZ - avgBlocker) * lightSizeUv / max(avgBlocker, 1e-4);
+    penumbra = max(penumbra, minPenumbra * texel);
+
+    // 3) Variable-radius PCF with hardware shadow compare.
+    float sum = 0.0;
+    for (int i = 0; i < pcfSamples; ++i) {
+        vec2 off = VogelDisk(i, pcfSamples, phi) * penumbra;
+        sum += texture(uShadowAtlas, vec4(uv + off, float(cascade), receiverZ));
+    }
+    return sum / float(pcfSamples);
+}
+
+void main() {
+    ivec2 px  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(pc.ResAndFlags.xy);
+    if (px.x >= res.x || px.y >= res.y) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(res);
+    float depth = texture(uDepth, uv).r;
+    if (depth >= 1.0) {
+        imageStore(uLightHDR, px, vec4(0.0));
+        return;
+    }
+
+    vec3 albedo = texture(uAlbedo,   uv).rgb;
+    vec3 encN   = texture(uNormal,   uv).rgb;
+    vec3 rmf    = texture(uRMF,      uv).rgb;
+    vec3 emiss  = texture(uEmissive, uv).rgb;
+
+    vec3  N         = normalize(encN * 2.0 - 1.0);
+    float roughness = max(rmf.r, 0.04);
+    float metallic  = rmf.g;
+    float F0Scalar  = rmf.b;
+
+    vec4 ndc      = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 worldH   = pc.InvViewProj * ndc;
+    vec3 worldPos = worldH.xyz / worldH.w;
+    vec3 V        = normalize(pc.EyePosWorld.xyz - worldPos);
+
+    vec3  L     = normalize(pc.SunDirAndIntensity.xyz);
+    vec3  H     = normalize(L + V);
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 1e-3);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    float D  = D_GGX(NdotH, roughness);
+    float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
+    vec3  F  = F_Schlick(VdotH, F0);
+
+    vec3 specular = D * Vt * F;
+    vec3 kS       = F;
+    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
+    vec3 diffuse  = kD * albedo / kPI;
+
+    float viewDepth = length(pc.EyePosWorld.xyz - worldPos);
+    float shadow    = SamplePcssShadow(worldPos, N, viewDepth, vec2(px));
+
+    vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;
+    vec3 lit = (diffuse + specular) * sunRadiance * NdotL * shadow;
+
+    vec3 ambient;
+    if (pc.IblParams.x >= 0.5) {
+        vec3 R       = reflect(-V, N);
+        vec3 irr     = texture(uIrradiance, N).rgb;
+        vec3 Fr      = F_SchlickRoughness(NdotV, F0, roughness);
+        vec3 kD_ibl  = (vec3(1.0) - Fr) * (1.0 - metallic);
+        float mips   = max(pc.IblParams.z - 1.0, 0.0);
+        vec3 prefilt = textureLod(uPrefilter, R, roughness * mips).rgb;
+        vec2 brdf    = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
+        vec3 specIBL = prefilt * (Fr * brdf.x + brdf.y);
+        ambient = (kD_ibl * irr * albedo + specIBL) * pc.IblParams.y;
+    } else {
+        ambient = albedo * pc.EyePosWorld.w;
+    }
+
+    imageStore(uLightHDR, px, vec4(lit + ambient + emiss, 1.0));
+}

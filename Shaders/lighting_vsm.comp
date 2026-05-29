@@ -1,0 +1,159 @@
+#version 450
+// Phase 11 VSM variant. Same set=1 / set=0 / set=3 contract. Set=2 has a single
+// sampler2DArray (RG16F linear) holding (E[x], E[x²]) per cascade. Visibility
+// via Chebyshev's inequality with light-bleed reduction (Lauritzen 2007).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 1, binding = 0) uniform sampler2D    uAlbedo;
+layout(set = 1, binding = 1) uniform sampler2D    uNormal;
+layout(set = 1, binding = 2) uniform sampler2D    uRMF;
+layout(set = 1, binding = 3) uniform sampler2D    uEmissive;
+layout(set = 1, binding = 4) uniform sampler2D    uDepth;
+layout(set = 1, binding = 5) uniform usampler2D   uIdentity;
+layout(set = 1, binding = 6) uniform samplerCube  uIrradiance;
+layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
+layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
+layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
+
+layout(set = 2, binding = 0) uniform sampler2DArray uMomentAtlas;     // RG16F linear, no compare
+layout(set = 2, binding = 1) uniform AlgoUbo {
+    mat4 CascadeViewProj[4];
+    vec4 CascadeSplits;
+    vec4 VSMParams;       // x = MinVariance, y = LightBleedReduction, z = depthBias, w = normalBias
+    vec4 AtlasParams;     // x = 1/cascadeSize, y = cascadeSize, z = cascadeCount, w = enabled
+} ualgo;
+
+layout(push_constant) uniform Push {
+    mat4 InvViewProj;
+    vec4 EyePosWorld;
+    vec4 SunDirAndIntensity;
+    vec4 SunColor;
+    vec4 IblParams;
+    vec4 ResAndFlags;
+} pc;
+
+const float kPI = 3.14159265359;
+
+float D_GGX(float NdotH, float roughness) {
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / (kPI * d * d + 1e-5);
+}
+float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
+    float a    = roughness * roughness;
+    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
+    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
+    return 0.5 / max(ggxV + ggxL, 1e-5);
+}
+vec3 F_Schlick(float VdotH, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
+    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Light-bleed reduction by linearly remapping pMax so the lower [0..LBR] range
+// is treated as "fully in shadow." Donnelly & Lauritzen's standard fix.
+float ReduceLightBleed(float pMax, float amount) {
+    return smoothstep(amount, 1.0, pMax);
+}
+
+float SampleVsmShadow(vec3 worldPos, vec3 worldN, float linearViewDepth) {
+    if (ualgo.AtlasParams.w < 0.5) return 1.0;  // disabled
+
+    int cascade = 3;
+    for (int c = 0; c < 4; ++c) {
+        if (linearViewDepth < ualgo.CascadeSplits[c]) { cascade = c; break; }
+    }
+
+    vec3 biasedPos = worldPos + worldN * ualgo.VSMParams.w;
+    vec4 lsPos = ualgo.CascadeViewProj[cascade] * vec4(biasedPos, 1.0);
+    if (lsPos.w <= 0.0) return 1.0;
+    vec3 ndc = lsPos.xyz / lsPos.w;
+    vec2 uv  = ndc.xy * 0.5 + 0.5;
+    float receiverZ = ndc.z - ualgo.VSMParams.z;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+    if (receiverZ < 0.0 || receiverZ > 1.0) return 1.0;
+
+    // Linear filter on the moments — gives a free pre-blur without a blur pass.
+    vec2  m  = texture(uMomentAtlas, vec3(uv, float(cascade))).rg;
+    float mu = m.x;
+    if (receiverZ <= mu) return 1.0;             // strictly in front of nearest blocker
+
+    float variance = max(m.y - mu * mu, ualgo.VSMParams.x);
+    float d        = receiverZ - mu;
+    float pMax     = variance / (variance + d * d);
+
+    return ReduceLightBleed(pMax, ualgo.VSMParams.y);
+}
+
+void main() {
+    ivec2 px  = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(pc.ResAndFlags.xy);
+    if (px.x >= res.x || px.y >= res.y) return;
+
+    vec2 uv = (vec2(px) + 0.5) / vec2(res);
+    float depth = texture(uDepth, uv).r;
+    if (depth >= 1.0) {
+        imageStore(uLightHDR, px, vec4(0.0));
+        return;
+    }
+
+    vec3 albedo = texture(uAlbedo,   uv).rgb;
+    vec3 encN   = texture(uNormal,   uv).rgb;
+    vec3 rmf    = texture(uRMF,      uv).rgb;
+    vec3 emiss  = texture(uEmissive, uv).rgb;
+
+    vec3  N         = normalize(encN * 2.0 - 1.0);
+    float roughness = max(rmf.r, 0.04);
+    float metallic  = rmf.g;
+    float F0Scalar  = rmf.b;
+
+    vec4 ndc      = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 worldH   = pc.InvViewProj * ndc;
+    vec3 worldPos = worldH.xyz / worldH.w;
+    vec3 V        = normalize(pc.EyePosWorld.xyz - worldPos);
+
+    vec3  L     = normalize(pc.SunDirAndIntensity.xyz);
+    vec3  H     = normalize(L + V);
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 1e-3);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    float D  = D_GGX(NdotH, roughness);
+    float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
+    vec3  F  = F_Schlick(VdotH, F0);
+
+    vec3 specular = D * Vt * F;
+    vec3 kS       = F;
+    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
+    vec3 diffuse  = kD * albedo / kPI;
+
+    float viewDepth = length(pc.EyePosWorld.xyz - worldPos);
+    float shadow    = SampleVsmShadow(worldPos, N, viewDepth);
+
+    vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;
+    vec3 lit = (diffuse + specular) * sunRadiance * NdotL * shadow;
+
+    vec3 ambient;
+    if (pc.IblParams.x >= 0.5) {
+        vec3 R       = reflect(-V, N);
+        vec3 irr     = texture(uIrradiance, N).rgb;
+        vec3 Fr      = F_SchlickRoughness(NdotV, F0, roughness);
+        vec3 kD_ibl  = (vec3(1.0) - Fr) * (1.0 - metallic);
+        float mips   = max(pc.IblParams.z - 1.0, 0.0);
+        vec3 prefilt = textureLod(uPrefilter, R, roughness * mips).rgb;
+        vec2 brdf    = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
+        vec3 specIBL = prefilt * (Fr * brdf.x + brdf.y);
+        ambient = (kD_ibl * irr * albedo + specIBL) * pc.IblParams.y;
+    } else {
+        ambient = albedo * pc.EyePosWorld.w;
+    }
+
+    imageStore(uLightHDR, px, vec4(lit + ambient + emiss, 1.0));
+}
