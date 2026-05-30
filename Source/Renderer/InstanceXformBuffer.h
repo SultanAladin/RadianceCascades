@@ -24,7 +24,7 @@ class Scene;
 struct InstanceXformBuffer {
     static constexpr uint32_t kMaxInstances = 256;
     static constexpr VkDeviceSize kBytes =
-        static_cast<VkDeviceSize>(kMaxInstances) * sizeof(glm::mat4);
+        16 + static_cast<VkDeviceSize>(kMaxInstances) * sizeof(glm::mat4);
 
     std::array<VkBuffer,       VulkanContext::kFramesInFlight> Buffers{};
     std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> Memories{};

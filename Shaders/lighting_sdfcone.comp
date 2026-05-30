@@ -42,9 +42,9 @@ layout(set = 2, binding = 1) uniform AlgoUbo {
 } ualgo;
 
 layout(set = 2, binding = 2, std430) readonly buffer InstanceXforms {
-    // Mesh-local space = inverse(model). worldPos→mesh-local mapping per
-    // pixel: invModel[instanceId] * vec4(worldPos, 1.0).
-    mat4 invModel[];
+    uint sdfInstanceCount;
+    uint pad0, pad1, pad2;
+    mat4 sdfInvModels[256];
 } uXforms;
 
 // ----------------------- push constants --------------------------------------
@@ -139,41 +139,47 @@ void main() {
     float shadow = 1.0;
     bool tracingOn = (ualgo.Flags.x > 0.5) && (ualgo.Flags.y > 0.5) && NdotL > 0.0;
     if (tracingOn) {
-        uint instId = texelFetch(uIdentity, px, 0).r;
-        mat4 invModel = uXforms.invModel[instId];
-
         // Step off the surface along N (in world space) before mapping in.
         vec3 roWorld = worldPos + N * ualgo.AABBMaxAndSurfaceOff.w;
-        vec3 roLocal = (invModel * vec4(roWorld, 1.0)).xyz;
+        
+        float minVis = 1.0;
+        uint count = min(uXforms.sdfInstanceCount, 256u);
+        for (uint i = 0; i < count; ++i) {
+            mat4 invModel = uXforms.sdfInvModels[i];
+            vec3 roLocal = (invModel * vec4(roWorld, 1.0)).xyz;
 
-        // Direction transforms by mat3(invModel). For uniform-scale + trans
-        // this is correct; re-normalise to drop the scale factor that ends
-        // up in the vector length.
-        vec3 rdLocalRaw = mat3(invModel) * L;
-        float scaleLocalPerWorld = length(rdLocalRaw); // e.g. 100 for cm→m
-        vec3  rdLocal = rdLocalRaw / max(scaleLocalPerWorld, 1e-6);
+            // Direction transforms by mat3(invModel). For uniform-scale + trans
+            // this is correct; re-normalise to drop the scale factor that ends
+            // up in the vector length.
+            vec3 rdLocalRaw = mat3(invModel) * L;
+            float scaleLocalPerWorld = length(rdLocalRaw); // e.g. 100 for cm→m
+            vec3  rdLocal = rdLocalRaw / max(scaleLocalPerWorld, 1e-6);
 
-        // maxDistance and minStep are world-space tunables; map to local.
-        float maxDistLocal = ualgo.TraceParams.y * scaleLocalPerWorld;
-        float minStepLocal = max(ualgo.TraceParams.z * scaleLocalPerWorld, 1e-4);
+            // maxDistance and minStep are world-space tunables; map to local.
+            float maxDistLocal = ualgo.TraceParams.y * scaleLocalPerWorld;
+            float minStepLocal = max(ualgo.TraceParams.z * scaleLocalPerWorld, 1e-4);
 
-        // Penumbra coefficient k = 1/tan(half_angle). Larger = sharper shadow.
-        // Half-angle 1.5° (default) → k ≈ 38. Matches the prototype's k=24
-        // (≈ 2.4° half-angle) form in rc3d_render.py::soft_shadow.
-        float k = 1.0 / max(tan(ualgo.SunDirAndHalfAngle.w), 1e-4);
-        int   maxSteps = int(clamp(ualgo.TraceParams.x, 1.0, 256.0));
+            // Penumbra coefficient k = 1/tan(half_angle). Larger = sharper shadow.
+            // Half-angle 1.5° (default) → k ≈ 38. Matches the prototype's k=24
+            // (≈ 2.4° half-angle) form in rc3d_render.py::soft_shadow.
+            float k = 1.0 / max(tan(ualgo.SunDirAndHalfAngle.w), 1e-4);
+            int   maxSteps = int(clamp(ualgo.TraceParams.x, 1.0, 256.0));
 
-        float vis = SDF_SoftShadow(uMeshSDF, roLocal, rdLocal,
-                                   maxDistLocal,
-                                   k,
-                                   maxSteps,
-                                   minStepLocal,
-                                   ualgo.AABBMinAndMaxDist.xyz,
-                                   ualgo.AABBMaxAndSurfaceOff.xyz,
-                                   ualgo.AABBMinAndMaxDist.w);
+            float vis = SDF_SoftShadow(uMeshSDF, roLocal, rdLocal,
+                                       maxDistLocal,
+                                       k,
+                                       maxSteps,
+                                       minStepLocal,
+                                       ualgo.AABBMinAndMaxDist.xyz,
+                                       ualgo.AABBMaxAndSurfaceOff.xyz,
+                                       ualgo.AABBMinAndMaxDist.w);
+            minVis = min(minVis, vis);
+            if (minVis <= 0.01) break;
+        }
+
         // Strength blends the trace result with full-lit (1.0). Strength=1 →
         // pure trace, Strength=0 → no shadow.
-        shadow = mix(1.0, vis, clamp(ualgo.TraceParams.w, 0.0, 1.0));
+        shadow = mix(1.0, minVis, clamp(ualgo.TraceParams.w, 0.0, 1.0));
     }
 
     vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;

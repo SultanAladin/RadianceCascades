@@ -84,42 +84,24 @@ void InstanceXformBufferRefresh(InstanceXformBuffer& xb,
                                 InstanceHandle sdfAnchorInstance) {
     if (frameSlot >= VulkanContext::kFramesInFlight || !xb.Mapped[frameSlot]) return;
 
-    glm::mat4* dst = static_cast<glm::mat4*>(xb.Mapped[frameSlot]);
+    struct alignas(16) Layout {
+        uint32_t count;
+        uint32_t pad[3];
+        glm::mat4 sdfInvModels[256];
+    };
+    Layout* dst = static_cast<Layout*>(xb.Mapped[frameSlot]);
+
+    dst->count = 0;
 
     const InstanceRegistry& reg = SceneInstances(scene);
 
-    // Resolve the SDF anchor's invModel up front. If the anchor handle is 0
-    // (no SDF resident, or no anchor chosen), `fallbackInv` stays identity
-    // and behavior matches pre-fix. The anchor only kicks in for instances
-    // whose mesh != sdfMesh (e.g. the floor) — same-mesh instances keep
-    // their own per-instance invModel so the 9-ball grid still self-shadows.
-    glm::mat4 fallbackInv(1.0f);
-    if (sdfMesh != 0 && sdfAnchorInstance != 0) {
-        if (const GpuInstance* anchor = reg.Get(sdfAnchorInstance)) {
-            fallbackInv = glm::inverse(anchor->Transform);
-        }
+    if (sdfMesh != 0) {
+        reg.ForEach([&](InstanceHandle handle, const GpuInstance& inst) {
+            if (inst.Mesh == sdfMesh && dst->count < InstanceXformBuffer::kMaxInstances) {
+                dst->sdfInvModels[dst->count++] = glm::inverse(inst.Transform);
+            }
+        });
     }
-
-    // Reset every slot to the fallback so destroyed / never-set instances
-    // map world→SDF-local-of-the-anchor (not world→world). 256 mat4s = 16 KB.
-    for (uint32_t k = 0; k < InstanceXformBuffer::kMaxInstances; ++k) {
-        dst[k] = fallbackInv;
-    }
-
-    reg.ForEach([&](InstanceHandle handle, const GpuInstance& inst) {
-        if (handle >= InstanceXformBuffer::kMaxInstances) return;
-        if (sdfMesh != 0 && inst.Mesh != sdfMesh) {
-            // Non-SDF mesh (e.g. floor): keep the anchor's invModel so the
-            // world→cm scale is correct. Without this the floor traces in
-            // world meters against a cm-AABB and the shadow is 100× too big.
-            dst[handle] = fallbackInv;
-            return;
-        }
-        // glm::inverse on an affine TRS is fine here. Scale-rotation-only
-        // would let us use affineInverse, but ShaderBall's transform composes
-        // translate * scale and may grow rotation later; inverse() is safer.
-        dst[handle] = glm::inverse(inst.Transform);
-    });
 }
 
 } // namespace RS
