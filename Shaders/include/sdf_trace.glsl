@@ -93,10 +93,13 @@ float SDF_SoftShadow(sampler3D sdfTex,
     for (int i = 0; i < maxSteps; ++i) {
         if (t > maxDist) break;
         float h = SDF_Sample(sdfTex, ro + rd * t, aabbMin, aabbMax, decodeScale);
+        if (h >= 1e5) {
+            break;
+        }
         if (h < 0.001) return 0.0;
         // IQ improved form: y = h^2/(2*ph) is the back-projected distance,
         // w = sqrt(h^2 - y^2) is the tangential component. k is the penumbra
-        // coefficient (1/tan(angle)); larger k → sharper.
+        // coefficient (1/tan(angle)); larger k -> sharper.
         float y = h * h / (2.0 * ph);
         float w = sqrt(max(h * h - y * y, 0.0));
         float denom = max(t - y, 1e-4);
@@ -143,6 +146,9 @@ bool SDF_TraceHit(sampler3D sdfTex,
         if (t > tMax) break;
         vec3 p = ro + rd * t;
         float h = SDF_Sample(sdfTex, p, aabbMin, aabbMax, decodeScale);
+        if (h >= 1e5) {
+            break;
+        }
         if (h < 0.001) {
             outPos = p;
             outDistTravelled = t;
