@@ -22,10 +22,11 @@ const char* kResolutionLabels[7] = { "32^3", "64^3", "96^3", "128^3",
                                      "256^3 (heavy)", "512^3 (very heavy)", "1024^3 (extreme)" };
 // VRAM cost at R16_SNORM: 32^3=64KB, 64^3=512KB, 128^3=4MB, 256^3=32MB,
 // 512^3=256MB, 1024^3=2GB. CPU bake time scales with res^3 × triangle count.
-const char* kAlgorithmLabels[3] = {
+const char* kAlgorithmLabels[4] = {
     "Exact (BVH brute-force)",
     "JFA (disabled in v1)",
     "Hybrid JFA + narrow-band (disabled in v1)",
+    "Fast Sweeping Method (CPU)",
 };
 const char* kVizModeLabels[5] = {
     "Signed RGB (default)",
@@ -376,7 +377,7 @@ void EnsurePreviewTexture(const VulkanContext& ctx, SdfBakerState& s) {
 }
 
 void KickBake(SdfBakerState& s, const VulkanContext& ctx,
-              const Scene& scene, MeshHandle mesh, uint32_t resolution) {
+              const Scene& scene, MeshHandle mesh, uint32_t resolution, int algorithmChoice) {
     if (s.BakeInFlight) return;
     const GpuMesh* gpuMesh = SceneMeshes(scene).Get(mesh);
     if (!gpuMesh) return;
@@ -396,8 +397,8 @@ void KickBake(SdfBakerState& s, const VulkanContext& ctx,
     const VulkanContext* ctxPtr = &ctx;
     const GpuMesh* meshPtr = gpuMesh;
 
-    s.Worker = std::thread([progress, pending, done, ctxPtr, meshPtr, resolution]() {
-        *pending = MeshSDFBakerBake(*ctxPtr, *meshPtr, resolution, progress.get());
+    s.Worker = std::thread([progress, pending, done, ctxPtr, meshPtr, resolution, algorithmChoice]() {
+        *pending = MeshSDFBakerBake(*ctxPtr, *meshPtr, resolution, progress.get(), algorithmChoice);
         done->store(true, std::memory_order_release);
     });
 }
@@ -556,7 +557,7 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
     }
     if (ImGui::BeginCombo("Algorithm", kAlgorithmLabels[s.AlgorithmChoice])) {
         for (int i = 0; i < IM_ARRAYSIZE(kAlgorithmLabels); ++i) {
-            const bool enabled = (i == 0);
+            const bool enabled = (i == 0 || i == 3);
             ImGui::BeginDisabled(!enabled);
             if (ImGui::Selectable(kAlgorithmLabels[i], i == s.AlgorithmChoice)) {
                 if (enabled) s.AlgorithmChoice = i;
@@ -603,7 +604,7 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
     const bool canAct = (s.TargetMesh != 0) && !s.BakeInFlight;
     ImGui::BeginDisabled(!canAct);
     if (ImGui::Button("Bake")) {
-        KickBake(s, ctx, scene, s.TargetMesh, SdfBakerResolutionPx(s));
+        KickBake(s, ctx, scene, s.TargetMesh, SdfBakerResolutionPx(s), s.AlgorithmChoice);
     }
     ImGui::SameLine();
     if (ImGui::Button("Re-bake")) {
@@ -612,7 +613,7 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
             residencyChanged = true;
             s.ResidentBakedCopy.reset();
         }
-        KickBake(s, ctx, scene, s.TargetMesh, SdfBakerResolutionPx(s));
+        KickBake(s, ctx, scene, s.TargetMesh, SdfBakerResolutionPx(s), s.AlgorithmChoice);
     }
     ImGui::SameLine();
     if (ImGui::Button("Load")) {

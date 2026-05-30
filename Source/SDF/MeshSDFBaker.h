@@ -33,6 +33,7 @@ struct BakeProgress {
 BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
                           const GpuMesh&       mesh,
                           uint32_t             resolution,
-                          BakeProgress*        progress);
+                          BakeProgress*        progress,
+                          int                  algorithmChoice = 0);
 
 } // namespace RS

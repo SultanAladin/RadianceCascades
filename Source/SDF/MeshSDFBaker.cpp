@@ -137,6 +137,7 @@ private:
         return d2;
     }
 
+public:
     // Eberly closest-point on triangle (regions 0-6).
     static glm::vec3 ClosestPointOnTriangle(const glm::vec3& p,
                                             const glm::vec3& a,
@@ -184,6 +185,7 @@ private:
         return a + ab * v + ac * w;
     }
 
+private:
     void DescendClosest(int nodeIdx, const glm::vec3& p,
                         float& bestSq, glm::vec3& bestPt, int& bestTri) const {
         const BvhNode& n = m_Nodes[nodeIdx];
@@ -260,7 +262,8 @@ bool ReadMeshCpuData(const VulkanContext& ctx, const GpuMesh& mesh,
 BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
                           const GpuMesh&       mesh,
                           uint32_t             resolution,
-                          BakeProgress*        progress) {
+                          BakeProgress*        progress,
+                          int                  algorithmChoice) {
     const auto bakeStart = std::chrono::steady_clock::now();
     BakedSDF result{};
     if (resolution == 0 || resolution > 256) {
@@ -343,56 +346,173 @@ BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
                               static_cast<size_t>(resolution);
     result.Voxels.assign(voxelCount, 0);
 
-    // 5. Parallel bake over Z slices.
-    const unsigned hwc = std::thread::hardware_concurrency();
-    const unsigned workerCount = hwc == 0 ? 4u : std::min(hwc, 16u);
-    std::atomic<uint32_t> nextZ { 0 };
-    std::atomic<uint32_t> doneZ { 0 };
+    if (algorithmChoice == 0) {
+        // 5. Parallel bake over Z slices (Brute-force).
+        const unsigned hwc = std::thread::hardware_concurrency();
+        const unsigned workerCount = hwc == 0 ? 4u : std::min(hwc, 16u);
+        std::atomic<uint32_t> nextZ { 0 };
+        std::atomic<uint32_t> doneZ { 0 };
 
-    auto worker = [&]() {
+        auto worker = [&]() {
+            const uint32_t res = resolution;
+            const glm::vec3 origin = result.AABBMin + 0.5f * voxelSize;
+            while (true) {
+                if (progress && progress->Cancel.load(std::memory_order_relaxed)) return;
+                const uint32_t z = nextZ.fetch_add(1, std::memory_order_relaxed);
+                if (z >= res) return;
+                for (uint32_t y = 0; y < res; ++y) {
+                    for (uint32_t x = 0; x < res; ++x) {
+                        const glm::vec3 p = origin + glm::vec3(
+                            voxelSize.x * static_cast<float>(x),
+                            voxelSize.y * static_cast<float>(y),
+                            voxelSize.z * static_cast<float>(z));
+
+                        float dsq; glm::vec3 cp; int triIdx;
+                        bvh.ClosestPoint(p, dsq, cp, triIdx);
+                        const float dist = std::sqrt(dsq);
+                        float signedDist = dist;
+                        if (triIdx >= 0) {
+                            const glm::vec3& n = bvh.GetTri(triIdx).Normal;
+                            if (glm::dot(p - cp, n) < 0.0f) signedDist = -dist;
+                        }
+
+                        // R16_SNORM encode
+                        const float t = std::max(-1.0f, std::min(1.0f,
+                            signedDist / result.MaxDist));
+                        const int q = static_cast<int>(std::lround(t * 32767.0f));
+                        const size_t idx = (static_cast<size_t>(z) * res + y) * res + x;
+                        result.Voxels[idx] = static_cast<int16_t>(q);
+                    }
+                }
+                const uint32_t finished = doneZ.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (progress) {
+                    progress->Fraction.store(static_cast<float>(finished) /
+                                             static_cast<float>(res),
+                                             std::memory_order_relaxed);
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(workerCount);
+        for (unsigned i = 0; i < workerCount; ++i) threads.emplace_back(worker);
+        for (auto& t : threads) t.join();
+    } else if (algorithmChoice == 3) {
+        // Fast Sweeping Method (FSM)
         const uint32_t res = resolution;
-        const glm::vec3 origin = result.AABBMin + 0.5f * voxelSize;
-        while (true) {
-            if (progress && progress->Cancel.load(std::memory_order_relaxed)) return;
-            const uint32_t z = nextZ.fetch_add(1, std::memory_order_relaxed);
-            if (z >= res) return;
-            for (uint32_t y = 0; y < res; ++y) {
-                for (uint32_t x = 0; x < res; ++x) {
-                    const glm::vec3 p = origin + glm::vec3(
-                        voxelSize.x * static_cast<float>(x),
-                        voxelSize.y * static_cast<float>(y),
-                        voxelSize.z * static_cast<float>(z));
+        const size_t voxelCount = static_cast<size_t>(res) * res * res;
+        std::vector<float> distSq(voxelCount, std::numeric_limits<float>::max());
+        std::vector<int> closestTri(voxelCount, -1);
+        
+        auto getIdx = [res](int x, int y, int z) -> size_t {
+            return (static_cast<size_t>(z) * res + y) * res + x;
+        };
 
-                    float dsq; glm::vec3 cp; int triIdx;
-                    bvh.ClosestPoint(p, dsq, cp, triIdx);
-                    const float dist = std::sqrt(dsq);
-                    float signedDist = dist;
+        const glm::vec3 origin = result.AABBMin + 0.5f * voxelSize;
+
+        // Step 1: Narrow band initialization
+        for (size_t t = 0; t < tris.size(); ++t) {
+            if (progress && progress->Cancel.load(std::memory_order_relaxed)) return result;
+            const Tri& tri = tris[t];
+            glm::vec3 triMin = (tri.AABBMin - result.AABBMin) / voxelSize;
+            glm::vec3 triMax = (tri.AABBMax - result.AABBMin) / voxelSize;
+            int minX = std::max(0, static_cast<int>(std::floor(triMin.x)) - 1);
+            int minY = std::max(0, static_cast<int>(std::floor(triMin.y)) - 1);
+            int minZ = std::max(0, static_cast<int>(std::floor(triMin.z)) - 1);
+            int maxX = std::min(static_cast<int>(res) - 1, static_cast<int>(std::ceil(triMax.x)) + 1);
+            int maxY = std::min(static_cast<int>(res) - 1, static_cast<int>(std::ceil(triMax.y)) + 1);
+            int maxZ = std::min(static_cast<int>(res) - 1, static_cast<int>(std::ceil(triMax.z)) + 1);
+
+            for (int z = minZ; z <= maxZ; ++z) {
+                for (int y = minY; y <= maxY; ++y) {
+                    for (int x = minX; x <= maxX; ++x) {
+                        glm::vec3 p = origin + glm::vec3(x * voxelSize.x, y * voxelSize.y, z * voxelSize.z);
+                        glm::vec3 cp = TriBVH::ClosestPointOnTriangle(p, tri.V0, tri.V1, tri.V2);
+                        float d2 = glm::dot(p - cp, p - cp);
+                        size_t idx = getIdx(x, y, z);
+                        if (d2 < distSq[idx]) {
+                            distSq[idx] = d2;
+                            closestTri[idx] = static_cast<int>(t);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 2: Sweeping passes
+        for (int pass = 0; pass < 8; ++pass) {
+            if (progress && progress->Cancel.load(std::memory_order_relaxed)) return result;
+            int dirX = (pass & 1) ? -1 : 1;
+            int dirY = (pass & 2) ? -1 : 1;
+            int dirZ = (pass & 4) ? -1 : 1;
+            int startX = (dirX > 0) ? 0 : res - 1;
+            int startY = (dirY > 0) ? 0 : res - 1;
+            int startZ = (dirZ > 0) ? 0 : res - 1;
+
+            for (int z = startZ; z >= 0 && z < static_cast<int>(res); z += dirZ) {
+                for (int y = startY; y >= 0 && y < static_cast<int>(res); y += dirY) {
+                    for (int x = startX; x >= 0 && x < static_cast<int>(res); x += dirX) {
+                        size_t idx = getIdx(x, y, z);
+                        glm::vec3 p = origin + glm::vec3(x * voxelSize.x, y * voxelSize.y, z * voxelSize.z);
+
+                        // Check 3 neighbors that have already been updated in this sweep
+                        int nx = x - dirX;
+                        int ny = y - dirY;
+                        int nz = z - dirZ;
+                        
+                        auto testNeighbor = [&](int nx, int ny, int nz) {
+                            if (nx >= 0 && nx < static_cast<int>(res) &&
+                                ny >= 0 && ny < static_cast<int>(res) &&
+                                nz >= 0 && nz < static_cast<int>(res)) {
+                                size_t nIdx = getIdx(nx, ny, nz);
+                                int nTri = closestTri[nIdx];
+                                if (nTri >= 0) {
+                                    const Tri& tri = tris[nTri];
+                                    glm::vec3 cp = TriBVH::ClosestPointOnTriangle(p, tri.V0, tri.V1, tri.V2);
+                                    float d2 = glm::dot(p - cp, p - cp);
+                                    if (d2 < distSq[idx]) {
+                                        distSq[idx] = d2;
+                                        closestTri[idx] = nTri;
+                                    }
+                                }
+                            }
+                        };
+
+                        testNeighbor(nx, y, z);
+                        testNeighbor(x, ny, z);
+                        testNeighbor(x, y, nz);
+                    }
+                }
+            }
+            if (progress) progress->Fraction.store((pass + 1) / 9.0f, std::memory_order_relaxed);
+        }
+
+        // Step 3: Sign evaluation and output
+        for (int z = 0; z < static_cast<int>(res); ++z) {
+            for (int y = 0; y < static_cast<int>(res); ++y) {
+                for (int x = 0; x < static_cast<int>(res); ++x) {
+                    size_t idx = getIdx(x, y, z);
+                    float signedDist = result.MaxDist; // Default to far outside
+                    int triIdx = closestTri[idx];
+                    
                     if (triIdx >= 0) {
-                        const glm::vec3& n = bvh.GetTri(triIdx).Normal;
-                        if (glm::dot(p - cp, n) < 0.0f) signedDist = -dist;
+                        const Tri& tri = tris[triIdx];
+                        glm::vec3 p = origin + glm::vec3(x * voxelSize.x, y * voxelSize.y, z * voxelSize.z);
+                        glm::vec3 cp = TriBVH::ClosestPointOnTriangle(p, tri.V0, tri.V1, tri.V2);
+                        float dist = std::sqrt(distSq[idx]);
+                        signedDist = dist;
+                        if (glm::dot(p - cp, tri.Normal) < 0.0f) signedDist = -dist;
                     }
 
                     // R16_SNORM encode
-                    const float t = std::max(-1.0f, std::min(1.0f,
-                        signedDist / result.MaxDist));
+                    const float t = std::max(-1.0f, std::min(1.0f, signedDist / result.MaxDist));
                     const int q = static_cast<int>(std::lround(t * 32767.0f));
-                    const size_t idx = (static_cast<size_t>(z) * res + y) * res + x;
                     result.Voxels[idx] = static_cast<int16_t>(q);
                 }
             }
-            const uint32_t finished = doneZ.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (progress) {
-                progress->Fraction.store(static_cast<float>(finished) /
-                                         static_cast<float>(res),
-                                         std::memory_order_relaxed);
-            }
         }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(workerCount);
-    for (unsigned i = 0; i < workerCount; ++i) threads.emplace_back(worker);
-    for (auto& t : threads) t.join();
+        if (progress) progress->Fraction.store(1.0f, std::memory_order_relaxed);
+    }
 
     if (progress && progress->Cancel.load(std::memory_order_relaxed)) {
         RS_LOG_INFO("MeshSDFBaker: bake cancelled (res %u)", resolution);
