@@ -486,6 +486,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RS::SkySettings             skySettings;
     RS::PanelSelection          panelSel;
     RS::SdfBakerState           sdfBaker;
+    RS::MeshHandle              activeSdfMesh = shaderBall;
 
     sdfBaker.TargetMesh       = shaderBall;
     sdfBaker.TargetSourcePath = kShaderBallPath;
@@ -582,6 +583,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // Helper — push the active resident SDF (or dummy) into both the
         // preview pass and the shadow algo if it's currently SDFConeShadow.
         auto pushSdfToConsumers = [&]() {
+            activeSdfMesh = sdfBaker.TargetMesh;
             const RS::ResidentSDF* r =
                 RS::GlobalSDFGet(globalSdf, sdfBaker.TargetMesh);
             VkImageView view = r ? r->View : globalSdf.DummyView;
@@ -737,7 +739,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             if (h != 0) { sdfAnchorInstance = h; break; }
         }
         RS::InstanceXformBufferRefresh(instanceXforms, frame.FrameSlot, scene,
-                                       sdfBaker.TargetMesh, sdfAnchorInstance);
+                                       activeSdfMesh, sdfAnchorInstance);
         shadow->RecordShadowPass(frame.Cmd, frameCtx);
 
         // Phase 14a: GI pre-frame (probe relight / hash insert) + gather. Both
