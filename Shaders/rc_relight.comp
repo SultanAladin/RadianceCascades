@@ -1,0 +1,197 @@
+#version 450
+// Phase 14b — Radiance Cascade hash relight pass.
+//
+// One workgroup per occupied cell (sourced from CellList[1..count]). Trace
+// R0=32 rays into the SDF, sample direct lighting at the hit (sun · NdotL ·
+// SDF cone-shadow), or look up the next-cascade SH probe at the miss endpoint
+// (radiance-interval extension, Taichi C4-validated). Accumulate into SH-L1
+// luma (4 bands × 1 channel = 1 vec4) and write to ProbePayload.
+//
+// Descriptor sets:
+//   set=0 : SDF (binding 0 = sampler3D R16_SNORM)
+//   set=1 : RcHash (same 4 bindings as rc_insert)
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "include/rc_hash.glsl"
+#include "include/sdf_trace.glsl"
+
+// ----------------------- set=0: SDF -------------------------------------------
+layout(set = 0, binding = 0) uniform sampler3D uSdf;
+
+// ----------------------- set=1: RC hash ---------------------------------------
+layout(std430, set = 1, binding = 0) buffer RC_KeyBuf     { uint  gRC_Keys[];     };
+layout(std430, set = 1, binding = 1) buffer RC_PayloadBuf { vec4  gRC_Payload[];  };
+layout(std140, set = 1, binding = 2) uniform RC_ParamsBuf { RcParams gRC_P; };
+layout(std430, set = 1, binding = 3) buffer RC_CellList   { uint  gRC_CellList[]; };
+
+// ----------------------- push constants ---------------------------------------
+layout(push_constant) uniform Push {
+    uint MaxSteps;       // sphere-trace iteration cap
+    float MinStep;       // floor on per-step march to avoid stalls
+    float MaxDistance;   // ray budget in world units
+    uint  _pad0;
+} pc;
+
+// ----------------------- helpers ---------------------------------------------
+
+// Compact uniform hemisphere sample using Hammersley + cosine warp.
+// Caller picks `i / N` for index; the second seed is per-cell jitter so two
+// cells don't sweep the same directions every frame.
+vec2 RC_Hammersley(uint i, uint N) {
+    uint bits = i;
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return vec2(float(i) / float(N), float(bits) * 2.3283064365386963e-10);
+}
+
+// Sphere sampling — RC probes are unoriented, so we sample the full sphere.
+vec3 RC_SphereDir(vec2 xi) {
+    float phi   = 6.2831853 * xi.x;
+    float cosT  = 1.0 - 2.0 * xi.y;
+    float sinT  = sqrt(max(0.0, 1.0 - cosT * cosT));
+    return vec3(cos(phi) * sinT, cosT, sin(phi) * sinT);
+}
+
+// Look up SH-L1 at world pos in the *next* cascade up. Used for the
+// radiance-interval extension when a ray escapes its budget without hitting.
+// Returns 0 if no slot found within probe cap.
+vec4 RC_FetchNextCascadeSh(vec3 worldPos, uint cascade) {
+    int  cascadeCount = int(gRC_P.CascadeParams.y);
+    uint nextC = min(cascade + 1u, uint(cascadeCount - 1));
+    vec3 eye   = gRC_P.EyePosAndHashLog2.xyz;
+    float s0   = gRC_P.CascadeParams.x;
+
+    ivec3 cell = RC_WorldToCell(worldPos, eye, s0, nextC);
+    uint  key  = RC_PackKey(cell, nextC);
+
+    const uint N = gRC_Keys.length();
+    const uint mask = N - 1u;
+    uint slot = RC_HashWord(key) & mask;
+    for (uint probe = 0u; probe < 8u; ++probe) {
+        uint stored = gRC_Keys[slot];
+        if (stored == 0u)  return vec4(0.0);
+        if (stored == key) return gRC_Payload[slot];
+        slot = (slot + 1u) & mask;
+    }
+    return vec4(0.0);
+}
+
+// ----------------------- main ------------------------------------------------
+
+void main() {
+    uint cellIdx = gl_GlobalInvocationID.x;
+    uint count   = gRC_CellList[0];
+    if (cellIdx >= count) return;
+
+    // CellList[1..count] holds the keys of occupied slots.
+    uint key = gRC_CellList[cellIdx + 1u];
+    if (key == 0u) return;
+
+    // Find the slot this key lives in (relight may run on a different frame
+    // ordering than insert, but same hash → same probe sequence).
+    const uint N = gRC_Keys.length();
+    const uint mask = N - 1u;
+    uint slot = RC_HashWord(key) & mask;
+    for (uint probe = 0u; probe < 8u; ++probe) {
+        if (gRC_Keys[slot] == key) break;
+        if (gRC_Keys[slot] == 0u)  return;     // key was inserted but slot was overwritten? bail
+        slot = (slot + 1u) & mask;
+    }
+
+    ivec3 cell; uint cascade;
+    RC_UnpackKey(key, cell, cascade);
+
+    vec3 eye   = gRC_P.EyePosAndHashLog2.xyz;
+    float s0   = gRC_P.CascadeParams.x;
+    vec3 probePos = RC_CellCenterWorld(cell, eye, s0, cascade);
+
+    int rayCount = int(gRC_P.CascadeParams.z);
+    rayCount = clamp(rayCount, 4, 64);
+
+    // Cascade c traces out to ~ cellPitch(c) × multiplier. Higher cascades
+    // trace longer rays so they catch farther-field bounces.
+    float cellPitch = RC_CellPitch(s0, cascade);
+    float maxDist   = max(pc.MaxDistance, cellPitch * 4.0);
+
+    // Per-cell jitter so neighbouring cells don't sweep identical directions.
+    uint jitter = uint(gRC_P.SecondaryParams.z) ^ key;
+    float jitterX = float(RC_HashWord(jitter)) * 2.3283064365386963e-10;
+    float jitterY = float(RC_HashWord(jitter ^ 0x9E3779B9u)) * 2.3283064365386963e-10;
+
+    vec3  sunDir       = normalize(gRC_P.SunDirAndIntensity.xyz);
+    float sunIntensity = gRC_P.SunDirAndIntensity.w;
+    vec3  sunColor     = gRC_P.SunColor.rgb;
+    float sunLuma      = dot(sunColor * sunIntensity, vec3(0.2126, 0.7152, 0.0722));
+    float ambientLuma  = gRC_P.SunColor.w;
+
+    vec3  aabbMin   = gRC_P.SdfAabbMin.xyz;
+    vec3  aabbMax   = gRC_P.SdfAabbMax.xyz;
+    float decode    = gRC_P.SdfAabbMax.w;
+
+    // Surface offset — start the ray slightly off the probe center to avoid
+    // self-intersection if the probe lands inside geometry.
+    float tMin = max(cellPitch * 0.05, 0.005);
+
+    vec4 shAccum = vec4(0.0);
+    float weightSum = 0.0;
+
+    for (int i = 0; i < rayCount; ++i) {
+        vec2 xi = RC_Hammersley(uint(i), uint(rayCount));
+        xi.x = fract(xi.x + jitterX);
+        xi.y = fract(xi.y + jitterY);
+        vec3 dir = RC_SphereDir(xi);
+
+        // Trace into SDF. Note: the SDF is mesh-local for the resident mesh.
+        // For Phase 14b we trace in mesh-local space directly — the C++ side
+        // writes mesh-local AABB into the params so probe positions are
+        // converted on the fly via probe⋅invModel before this dispatch.
+        // (Simplest pre-multi-mesh: pretend world == mesh-local; revisit when
+        // multi-mesh SDF lands.)
+        vec3 outPos, outNormal;
+        float outDist;
+        bool hit = SDF_TraceHit(uSdf, probePos, dir, tMin, maxDist,
+                                int(pc.MaxSteps), pc.MinStep,
+                                aabbMin, aabbMax, decode,
+                                outPos, outNormal, outDist);
+
+        float radianceLuma = 0.0;
+        if (hit) {
+            // Direct lighting: sun · max(N·L, 0) · sky-tinted ambient fill.
+            float NdotL = max(dot(outNormal, sunDir), 0.0);
+            // Visibility = secondary cone trace toward sun from the hit point.
+            // Reuse SDF_SoftShadow with a single hard cone (k = large).
+            float vis = SDF_SoftShadow(uSdf, outPos, sunDir,
+                                       maxDist, 32.0,
+                                       int(pc.MaxSteps), pc.MinStep,
+                                       aabbMin, aabbMax, decode);
+            radianceLuma = sunLuma * NdotL * vis + ambientLuma;
+        } else {
+            // Escape: chain into next cascade's SH probe at endpoint
+            // (radiance-interval extension, Taichi C4-validated).
+            vec4 nextSh = RC_FetchNextCascadeSh(outPos, cascade);
+            // Eval as ambient (N = +Y is fine — SH probe is approximately
+            // omni at this scale; we just want the band-0 magnitude).
+            radianceLuma = max(nextSh.x * 3.14159265 * kSH_Y00, 0.0);
+            // Sky contribution above the horizon — light dome fill.
+            radianceLuma += max(dir.y, 0.0) * ambientLuma * 0.5;
+        }
+
+        shAccum += RC_ProjectShL1(dir, radianceLuma);
+        weightSum += 1.0;
+    }
+
+    if (weightSum > 0.0) {
+        shAccum *= (4.0 * 3.14159265) / weightSum;   // monte-carlo norm (sphere)
+    }
+
+    // EMA with previous-frame payload so the result is temporally stable.
+    vec4 prev = gRC_Payload[slot];
+    float alpha = 0.25;                              // 4-frame EMA
+    gRC_Payload[slot] = mix(prev, shAccum, alpha);
+}

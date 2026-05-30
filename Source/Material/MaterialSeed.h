@@ -23,8 +23,9 @@ struct SeededMaterials {
     MaterialHandle BrushedAluminium = 0;
     MaterialHandle MatteBlackRubber = 0;
     MaterialHandle EmissiveCyan     = 0;
+    MaterialHandle Floor            = 0;   // Phase 11.5 — dev-engine checker floor
 
-    static constexpr uint32_t kCount = 6;
+    static constexpr uint32_t kCount = 7;
 };
 
 // Push the 6 demos into the registry in fixed order. Caller is responsible for

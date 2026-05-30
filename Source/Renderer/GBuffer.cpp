@@ -25,6 +25,8 @@ struct GBufferPushConstants {
     glm::vec4 RoughMetalF0Emissive;  // r=roughness g=metallic b=F0 a=emissive scale
     glm::vec4 EmissiveColor;         // rgb = emissive colour, a = unused
     glm::uvec4 IdentityIds;          // x = instanceId, y = submeshId
+    glm::vec4 FloorParams;           // x = checker spacing (m), y = strength,
+                                     // z = flag (>=0.5 → floor), w = dark tint scale
 };
 #pragma pack(pop)
 static_assert(sizeof(GBufferPushConstants) <= 256,
@@ -327,7 +329,8 @@ void GBufferPassRecord(GBufferPass& gp, const VulkanContext& ctx,
                        const MeshRegistry& meshes,
                        const InstanceRegistry& instances,
                        MaterialRegistry& materials,
-                       const GBufferMaterial& fallback) {
+                       const GBufferMaterial& fallback,
+                       const GBufferFloorConfig& floor) {
     VkClearValue clears[6]{};
     // Albedo / normal / RMF / emissive / identity all clear to 0.
     clears[5].depthStencil = { 1.0f, 0 };
@@ -376,6 +379,13 @@ void GBufferPassRecord(GBufferPass& gp, const VulkanContext& ctx,
                                                 gm.F0, 1.0f);
             pc.EmissiveColor        = glm::vec4(gm.Emissive, 0.0f);
             pc.IdentityIds          = glm::uvec4(static_cast<uint32_t>(handle), s, 0u, 0u);
+
+            const bool isFloor = (floor.FloorInstance != 0 &&
+                                  handle == floor.FloorInstance);
+            pc.FloorParams = isFloor
+                ? glm::vec4(floor.CheckerSpacing, floor.CheckerStrength,
+                            1.0f, floor.DarkTintScale)
+                : glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
             vkCmdPushConstants(cmd, gp.PipelineLayout,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);

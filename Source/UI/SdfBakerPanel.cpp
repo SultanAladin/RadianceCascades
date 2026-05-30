@@ -17,8 +17,11 @@ namespace RS {
 
 namespace {
 
-constexpr int kResolutions[4] = { 32, 64, 96, 128 };
-const char* kResolutionLabels[4] = { "32^3", "64^3", "96^3", "128^3" };
+constexpr int kResolutions[7] = { 32, 64, 96, 128, 256, 512, 1024 };
+const char* kResolutionLabels[7] = { "32^3", "64^3", "96^3", "128^3",
+                                     "256^3 (heavy)", "512^3 (very heavy)", "1024^3 (extreme)" };
+// VRAM cost at R16_SNORM: 32^3=64KB, 64^3=512KB, 128^3=4MB, 256^3=32MB,
+// 512^3=256MB, 1024^3=2GB. CPU bake time scales with res^3 × triangle count.
 const char* kAlgorithmLabels[3] = {
     "Exact (BVH brute-force)",
     "JFA (disabled in v1)",
@@ -463,7 +466,8 @@ void FinaliseBake(SdfBakerState& s, const VulkanContext& ctx, GlobalSDF& globalS
 } // namespace
 
 uint32_t SdfBakerResolutionPx(const SdfBakerState& s) {
-    const int idx = std::clamp(s.ResolutionChoice, 0, 3);
+    const int idx = std::clamp(s.ResolutionChoice, 0,
+                               static_cast<int>(IM_ARRAYSIZE(kResolutions)) - 1);
     return static_cast<uint32_t>(kResolutions[idx]);
 }
 
@@ -540,6 +544,16 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
     ImGui::TextUnformatted("Settings");
     ImGui::Combo("Resolution", &s.ResolutionChoice, kResolutionLabels,
                  IM_ARRAYSIZE(kResolutionLabels));
+    if (s.ResolutionChoice >= 4) {
+        // 256^3 and above — surface bake cost so the user isn't surprised.
+        const uint32_t r = SdfBakerResolutionPx(s);
+        const uint64_t voxels = static_cast<uint64_t>(r) * r * r;
+        const uint64_t vramMB = (voxels * 2u) / (1024u * 1024u);
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                           "Warning: %u^3 = %llu voxels (%llu MB VRAM); bake may take minutes.",
+                           r, static_cast<unsigned long long>(voxels),
+                           static_cast<unsigned long long>(vramMB));
+    }
     if (ImGui::BeginCombo("Algorithm", kAlgorithmLabels[s.AlgorithmChoice])) {
         for (int i = 0; i < IM_ARRAYSIZE(kAlgorithmLabels); ++i) {
             const bool enabled = (i == 0);

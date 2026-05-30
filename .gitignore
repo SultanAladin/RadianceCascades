@@ -33,3 +33,6 @@ Desktop.ini
 # Docs (design notes, HTML, Python harness)
 Docs/
 *.html
+
+# Baked SDF cache (regeneratable; large binary)
+Cache/

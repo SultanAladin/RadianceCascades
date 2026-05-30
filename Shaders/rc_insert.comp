@@ -1,0 +1,131 @@
+#version 450
+// Phase 14b — Radiance Cascade hash insertion pass.
+//
+// One pipeline, two dispatch modes (selected via push constant `pc.Mode`):
+//   Mode 0 (PRIMARY)   — 8×8 over downsampled GBuffer (4×). Reads depth +
+//                         identity, reconstructs worldPos, picks cascade,
+//                         packs cell key, hash + linear-probe + atomicCAS.
+//                         On a fresh claim, append the key to CellList.
+//   Mode 1 (SECONDARY) — 4×4×4 over a frustum-extended cell volume. Inserts
+//                         off-screen probes within `radius` cells of camera
+//                         to close the 11.5% screen-only coverage gap.
+//
+// Descriptor sets:
+//   set=0 : GBuffer (binding 0=depth sampler2D, 1=identity usampler2D)
+//   set=1 : RcHash (binding 0=keys SSBO, 1=payload SSBO, 2=params UBO,
+//                    3=cell list SSBO)
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// rc_hash.glsl declares RcParams (struct) + RC_ helpers — must come BEFORE the
+// SSBO/UBO block declarations because the params UBO uses RcParams.
+#include "include/rc_hash.glsl"
+
+// ----------------------- set=0: GBuffer slices --------------------------------
+layout(set = 0, binding = 0) uniform sampler2D  uDepth;
+layout(set = 0, binding = 1) uniform usampler2D uIdentity;   // unused for now
+
+// ----------------------- set=1: RC hash ---------------------------------------
+layout(std430, set = 1, binding = 0) buffer RC_KeyBuf     { uint  gRC_Keys[];     };
+layout(std430, set = 1, binding = 1) buffer RC_PayloadBuf { vec4  gRC_Payload[];  };
+layout(std140, set = 1, binding = 2) uniform RC_ParamsBuf { RcParams gRC_P; };
+layout(std430, set = 1, binding = 3) buffer RC_CellList   { uint  gRC_CellList[]; };
+
+// ----------------------- push constants ---------------------------------------
+layout(push_constant) uniform Push {
+    uint Mode;            // 0 = primary (screen), 1 = secondary (frustum extend)
+    uint DownsampleShift; // primary mode: bit-shift of source pixel to lookup
+                          // (>>2 = 4× downsample; >>3 = 8× etc.)
+    uint SecondaryRadius; // secondary mode: cell radius around eye to seed
+    uint _pad0;
+} pc;
+
+// ----------------------- shared helpers ---------------------------------------
+
+// Try to claim a hash slot for the packed cell key. On success returns true and
+// the key was atomically inserted; on failure the table is saturated past the
+// probe cap and the key was not stored.
+//   - Empty slots = 0
+//   - On a fresh claim we also append to CellList so relight knows the slot.
+bool RC_Insert(uint key) {
+    const uint N = gRC_Keys.length();
+    const uint mask = N - 1u;             // N is power of two
+    uint slot = RC_HashWord(key) & mask;
+    for (uint probe = 0u; probe < 8u; ++probe) {
+        uint expected = 0u;
+        uint old = atomicCompSwap(gRC_Keys[slot], expected, key);
+        if (old == 0u) {
+            // First-time insert: clear payload, append to cell list.
+            gRC_Payload[slot] = vec4(0.0);
+            uint listIdx = atomicAdd(gRC_CellList[0], 1u);
+            // CellList[1..N] is the storage area; cap at N to avoid overflow.
+            if (listIdx + 1u < gRC_CellList.length()) {
+                gRC_CellList[listIdx + 1u] = key;
+            }
+            return true;
+        }
+        if (old == key) return true;      // already present, dedup
+        slot = (slot + 1u) & mask;
+    }
+    return false;
+}
+
+// World-pos reconstruction from depth (matches lighting.comp).
+vec3 RC_WorldFromDepth(vec2 uv, float depth) {
+    vec4 ndc  = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    mat4 ivp  = mat4(gRC_P.InvViewProj0,
+                     gRC_P.InvViewProj1,
+                     gRC_P.InvViewProj2,
+                     gRC_P.InvViewProj3);
+    vec4 wh   = ivp * ndc;
+    return wh.xyz / wh.w;
+}
+
+// ----------------------- main ------------------------------------------------
+
+void main() {
+    float s0           = gRC_P.CascadeParams.x;
+    int   cascadeCount = int(gRC_P.CascadeParams.y);
+    vec3  eye          = gRC_P.EyePosAndHashLog2.xyz;
+
+    if (pc.Mode == 0u) {
+        // ---- PRIMARY: visible-pixel insertion -------------------------------
+        ivec2 lo = ivec2(gl_GlobalInvocationID.xy);
+        ivec2 res = ivec2(gRC_P.RenderExtentAndFlags.xy);
+        ivec2 px  = lo << int(pc.DownsampleShift);
+        if (px.x >= res.x || px.y >= res.y) return;
+
+        vec2 uv = (vec2(px) + 0.5) / vec2(res);
+        float depth = texture(uDepth, uv).r;
+        if (depth >= 1.0) return;          // background — skip
+
+        vec3 worldPos = RC_WorldFromDepth(uv, depth);
+        uint cascade  = RC_PickCascade(worldPos, eye, s0, cascadeCount);
+        ivec3 cell    = RC_WorldToCell(worldPos, eye, s0, cascade);
+        uint  key     = RC_PackKey(cell, cascade);
+        RC_Insert(key);
+        return;
+    }
+
+    // ---- SECONDARY: frustum-extended off-screen insertion -------------------
+    // Dispatch is a 3D grid sized (2R+1)^3 centred on the eye for cascade 0.
+    // Each thread = one cell offset. We seed only the volume around the eye —
+    // the camera frustum's natural growth is handled by higher cascades using
+    // a larger radius (grows by SecondaryParams.y per level).
+    int  R = int(pc.SecondaryRadius);
+    ivec3 ofs = ivec3(gl_GlobalInvocationID.xyz) - ivec3(R);
+    if (any(greaterThan(abs(ofs), ivec3(R)))) return;
+
+    // Insert for every cascade level so the relight pass has off-screen
+    // payload to consume at higher cascades too.
+    int growPerCascade = int(gRC_P.SecondaryParams.y);
+    for (int c = 0; c < cascadeCount; ++c) {
+        int Rc = R + c * growPerCascade;
+        if (any(greaterThan(abs(ofs), ivec3(Rc)))) continue;
+        ivec3 cell = ofs;
+        uint  key  = RC_PackKey(cell, uint(c));
+        RC_Insert(key);
+    }
+}

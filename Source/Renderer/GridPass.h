@@ -49,8 +49,14 @@ struct GridSettings {
     // Phase 8 polish: classic dev-engine checker floor. CheckerSpacing is in
     // metres; CheckerStrength fades the checker into the GroundColor (0 = off,
     // 1 = full contrast). Two-band greyscale by default, matches Unity/Godot.
+    //
+    // Phase 11.5: now defaults to 0 because the floor lives in the GBuffer as
+    // a real mesh (Source/Scene/FloorMesh.{h,cpp}) which paints the same
+    // checker pattern and catches shadows. The GridPass branch survives so
+    // panels-with-no-floor (e.g. an editor host that turns the floor off) can
+    // still get a procedural ground at glancing angles.
     float CheckerSpacing  = 1.0f;
-    float CheckerStrength = 0.55f;
+    float CheckerStrength = 0.00f;
     float CheckerLight[3] = { 0.58f, 0.58f, 0.60f };
     float CheckerDark [3] = { 0.34f, 0.34f, 0.36f };
 };

@@ -8,7 +8,12 @@
 // Descriptor contract at set=2 for the SDFCone variant:
 //   binding 0 = sampler3D R16_SNORM (the resident mesh SDF — fallback dummy
 //               when no mesh is resident, so the binding is always safe)
-//   binding 1 = AlgoUbo (64 bytes — SunDir, AABBMin/Max+decode, trace params)
+//   binding 1 = AlgoUbo (80 bytes — SunDir, AABBMin/Max+decode, trace params)
+//   binding 2 = InstanceXformBuffer SSBO (per-instance mat4 InverseModel[256]).
+//               The lighting shader reads the GBuffer identity attachment,
+//               looks up the inverse-model matrix, and traces in MESH-LOCAL
+//               space — the SDF was baked in mesh-local space, so the AABB
+//               at binding 1 already lives in the right coord frame.
 //
 // The view bound at binding 0 has to track the GlobalSDF residency table:
 // `Set` is called from Main.cpp's residency-changed branch (the same spot
@@ -68,6 +73,12 @@ public:
                 const glm::vec3& aabbMin, const glm::vec3& aabbMax,
                 float maxDist, bool hasSDF);
 
+    // Phase 13.5: per-instance inverse-model SSBO ring (one per frame-in-flight).
+    // Bound at set=2 binding 2. Main.cpp wires this once after Initialize;
+    // rebinding happens under vkDeviceWaitIdle so no in-flight frame sees a
+    // dangling buffer.
+    void SetInstanceXformBuffer(const VkBuffer* ssbosByFrame, VkDeviceSize bytesPerSlot);
+
     // Latest-known residency state. SetSDF stores into these so RecordShadowPass
     // can stamp the UBO without the caller passing the geometry every frame.
     bool HasSDF() const { return m_HasSDF; }
@@ -111,6 +122,12 @@ private:
     std::array<VkBuffer,       VulkanContext::kFramesInFlight> m_AlgoUboBuffers{};
     std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> m_AlgoUboMemory{};
     std::array<void*,          VulkanContext::kFramesInFlight> m_AlgoUboMapped{};
+
+    // Per-instance inverse-model SSBO ring (one slot per frame-in-flight).
+    // Owned by InstanceXformBuffer in Main.cpp; we only hold the handles for
+    // descriptor writes. m_XformBytes is the per-slot size.
+    std::array<VkBuffer, VulkanContext::kFramesInFlight> m_InstXformBuffers{};
+    VkDeviceSize                                         m_XformBytes = 0;
 
     VkDescriptorSetLayout m_LightingSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool      m_DescriptorPool    = VK_NULL_HANDLE;

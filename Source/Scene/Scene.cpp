@@ -110,4 +110,12 @@ InstanceRegistry& SceneInstancesMut(Scene& scene) {
     return scene.m_Impl->Instances;
 }
 
+MeshHandle SceneInscribeProceduralMesh(Scene& scene, const ParsedMesh& parsed) {
+    if (!scene.m_Impl || !scene.m_Impl->Vk) {
+        RS_LOG_ERROR("SceneInscribeProceduralMesh before SceneAttachVulkan");
+        return 0;
+    }
+    return scene.m_Impl->Meshes.Upload(*scene.m_Impl->Vk, parsed);
+}
+
 } // namespace RS

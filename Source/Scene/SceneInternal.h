@@ -30,4 +30,9 @@ const InstanceRegistry& SceneInstances(const Scene& scene);
 // the caller already holds onto.
 InstanceRegistry&       SceneInstancesMut(Scene& scene);
 
+// Inscribe a procedurally-built mesh (skips ObjLoader). Used by FloorMesh and
+// anything else synthesised in code rather than loaded from disk. Returns the
+// uploaded MeshHandle, or 0 on failure.
+MeshHandle SceneInscribeProceduralMesh(Scene& scene, const ParsedMesh& parsed);
+
 } // namespace RS

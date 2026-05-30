@@ -8,6 +8,8 @@
 
 namespace RS {
 
+struct ParsedMesh;   // Source/Scene/ObjLoader.h — used by the procedural-inscribe friend
+
 using MeshHandle     = uint32_t;
 using SubmeshIndex   = uint32_t;
 using InstanceHandle = uint32_t;
@@ -50,6 +52,7 @@ private:
     friend const class MeshRegistry&     SceneMeshes      (const Scene&);
     friend const class InstanceRegistry& SceneInstances   (const Scene&);
     friend       class InstanceRegistry& SceneInstancesMut(Scene&);
+    friend MeshHandle SceneInscribeProceduralMesh(Scene&, const ParsedMesh&);
 };
 
 } // namespace RS

@@ -38,6 +38,16 @@ struct GBufferMaterial {
 // also brings textured Fresnel.
 GBufferMaterial GBufferMaterialFromPbr(const PbrMaterial& m);
 
+// Phase 11.5 floor checker config — drives the procedural two-tile pattern in
+// gbuffer.frag for whichever instance matches `FloorInstance`. Zero handle
+// disables the floor branch entirely.
+struct GBufferFloorConfig {
+    InstanceHandle FloorInstance  = 0;       // which instance is the floor
+    float          CheckerSpacing = 1.0f;    // metres per tile
+    float          CheckerStrength = 0.85f;  // 0 = flat albedo, 1 = full contrast
+    float          DarkTintScale  = 0.55f;   // dark tile = BaseColor * DarkTintScale
+};
+
 struct GBufferPass {
     VkRenderPass     RenderPass     = VK_NULL_HANDLE;
     VkPipelineLayout PipelineLayout = VK_NULL_HANDLE;
@@ -63,6 +73,7 @@ void GBufferPassRecord(GBufferPass& gp, const VulkanContext& ctx,
                        const MeshRegistry& meshes,
                        const InstanceRegistry& instances,
                        MaterialRegistry& materials,
-                       const GBufferMaterial& fallback);
+                       const GBufferMaterial& fallback,
+                       const GBufferFloorConfig& floor);
 
 } // namespace RS

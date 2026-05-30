@@ -11,6 +11,7 @@ layout(push_constant) uniform Push {
     vec4 RoughMetalF0Emissive;
     vec4 EmissiveColor;
     uvec4 IdentityIds;
+    vec4 FloorParams;
 } pc;
 
 layout(location = 0) out vec3 vWorldNormal;

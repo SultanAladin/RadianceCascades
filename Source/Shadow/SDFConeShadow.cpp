@@ -137,6 +137,17 @@ void SDFConeShadow::SetSDF(VkImageView sdfView, VkSampler sampler,
     RewriteAllSets();
 }
 
+void SDFConeShadow::SetInstanceXformBuffer(const VkBuffer* ssbosByFrame,
+                                           VkDeviceSize bytesPerSlot) {
+    if (!ssbosByFrame || bytesPerSlot == 0) return;
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        m_InstXformBuffers[i] = ssbosByFrame[i];
+    }
+    m_XformBytes = bytesPerSlot;
+    if (!m_Ctx || !m_LightingSetLayout) return;
+    RewriteAllSets();
+}
+
 // -- one-time GPU resource creation ------------------------------------------
 
 bool SDFConeShadow::CreateSampler() {
@@ -155,7 +166,7 @@ bool SDFConeShadow::CreateSampler() {
 }
 
 bool SDFConeShadow::CreateSetLayout() {
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    VkDescriptorSetLayoutBinding bindings[3]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[0].descriptorCount = 1;
@@ -166,8 +177,13 @@ bool SDFConeShadow::CreateSetLayout() {
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    bindings[2].binding         = 2;
+    bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 2;
+    lci.bindingCount = 3;
     lci.pBindings    = bindings;
     return vkCreateDescriptorSetLayout(m_Ctx->Device, &lci, nullptr, &m_LightingSetLayout) == VK_SUCCESS;
 }
@@ -199,15 +215,17 @@ bool SDFConeShadow::CreateAlgoUbos() {
 }
 
 bool SDFConeShadow::CreateDescriptorSets() {
-    VkDescriptorPoolSize sizes[2]{};
+    VkDescriptorPoolSize sizes[3]{};
     sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = VulkanContext::kFramesInFlight;
     sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = VulkanContext::kFramesInFlight;
+    sizes[2].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[2].descriptorCount = VulkanContext::kFramesInFlight;
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets       = VulkanContext::kFramesInFlight;
-    pci.poolSizeCount = 2;
+    pci.poolSizeCount = 3;
     pci.pPoolSizes    = sizes;
     if (vkCreateDescriptorPool(m_Ctx->Device, &pci, nullptr, &m_DescriptorPool) != VK_SUCCESS) return false;
 
@@ -243,27 +261,50 @@ bool SDFConeShadow::CreateDescriptorSets() {
 }
 
 void SDFConeShadow::RewriteAllSets() {
-    if (!m_Ctx || m_SdfView == VK_NULL_HANDLE) return;
+    if (!m_Ctx) return;
     vkDeviceWaitIdle(m_Ctx->Device);
 
     for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
-        VkDescriptorImageInfo img{};
-        img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        img.imageView   = m_SdfView;
-        // Prefer the panel-supplied sampler (GlobalSDF::Sampler) when present;
-        // fall back to our own linear/clamp sampler. They're functionally
-        // identical — this just avoids a redundant VkSampler.
-        img.sampler     = (m_SdfSampler != VK_NULL_HANDLE)
-                              ? m_SdfSampler : m_LinearClampSampler;
+        VkWriteDescriptorSet writes[2]{};
+        VkDescriptorImageInfo  img{};
+        VkDescriptorBufferInfo buf{};
+        uint32_t n = 0;
 
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = m_FrameSets[i];
-        w.dstBinding      = 0;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo      = &img;
-        vkUpdateDescriptorSets(m_Ctx->Device, 1, &w, 0, nullptr);
+        if (m_SdfView != VK_NULL_HANDLE) {
+            img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            img.imageView   = m_SdfView;
+            // Prefer the panel-supplied sampler (GlobalSDF::Sampler) when present;
+            // fall back to our own linear/clamp sampler. They're functionally
+            // identical — this just avoids a redundant VkSampler.
+            img.sampler     = (m_SdfSampler != VK_NULL_HANDLE)
+                                  ? m_SdfSampler : m_LinearClampSampler;
+
+            writes[n].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[n].dstSet          = m_FrameSets[i];
+            writes[n].dstBinding      = 0;
+            writes[n].descriptorCount = 1;
+            writes[n].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[n].pImageInfo      = &img;
+            ++n;
+        }
+
+        if (m_InstXformBuffers[i] != VK_NULL_HANDLE && m_XformBytes > 0) {
+            buf.buffer = m_InstXformBuffers[i];
+            buf.offset = 0;
+            buf.range  = m_XformBytes;
+
+            writes[n].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[n].dstSet          = m_FrameSets[i];
+            writes[n].dstBinding      = 2;
+            writes[n].descriptorCount = 1;
+            writes[n].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[n].pBufferInfo     = &buf;
+            ++n;
+        }
+
+        if (n > 0) {
+            vkUpdateDescriptorSets(m_Ctx->Device, n, writes, 0, nullptr);
+        }
     }
 }
 

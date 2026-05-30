@@ -88,6 +88,19 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         s.EmissiveCyan = registry.Create(m);
     }
 
+    // 6 - Floor. Light tile colour lives in AlbedoFlat; the dark tile is
+    // derived in gbuffer.frag via GBufferFloorConfig::DarkTintScale. Rough
+    // dielectric so the IBL + shadow integration reads naturally.
+    {
+        PbrMaterial m{};
+        m.AlbedoFlat    = glm::vec3(0.58f, 0.58f, 0.60f);
+        m.RoughnessFlat = 0.85f;
+        m.MetallicFlat  = 0.0f;
+        m.F0Flat        = glm::vec3(0.04f);
+        SetName(m, "Floor");
+        s.Floor = registry.Create(m);
+    }
+
     return s;
 }
 

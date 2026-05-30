@@ -21,6 +21,7 @@
 #include "Renderer/Lighting.h"
 #include "Renderer/OffscreenTargets.h"
 #include "Renderer/Picking.h"
+#include "Renderer/InstanceXformBuffer.h"
 #include "Renderer/SkyAtmosphere.h"
 #include "Renderer/FrameContext.h"
 #include "Shadow/IShadowAlgorithm.h"
@@ -34,6 +35,7 @@
 #include "RS/RenderSettings.h"
 #include "SDF/GlobalSDF.h"
 #include "Material/MaterialSeed.h"
+#include "Scene/FloorMesh.h"
 #include "Scene/SceneInternal.h"
 #include "UI/ImGuiContextRS.h"
 #include "UI/ImGuiPanel.h"
@@ -363,6 +365,22 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     shadow->Initialize(vk, RS::OffscreenFormatDepth(),
                        { RS::ShadowMap::kCascadeSize, RS::ShadowMap::kCascadeSize });
 
+    // Phase 13.5 — per-instance inverse-model SSBO ring. Fixes the SDF-shadow
+    // coord-space mismatch (SDF baked in mesh-local; pixels are in world).
+    // Bound at SDFCone set=2 binding 2; ignored by PCF/PCSS/VSM.
+    RS::InstanceXformBuffer instanceXforms;
+    if (!RS::InstanceXformBufferInitialize(instanceXforms, vk)) {
+        RS_LOG_ERROR("InstanceXformBufferInitialize failed");
+        return 11;
+    }
+    auto pushInstanceXformsIfSDFCone = [&]() {
+        if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
+            cone->SetInstanceXformBuffer(instanceXforms.Buffers.data(),
+                                         RS::InstanceXformBuffer::kBytes);
+        }
+    };
+    pushInstanceXformsIfSDFCone();
+
     RS::LightingPass lighting;
     if (!RS::LightingPassInitialize(lighting, vk, targets, sky, *shadow,
                                     "Artifacts/Shaders")) {
@@ -375,12 +393,21 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     // stubs at this point (no compute work) — the wiring is what unlocks
     // 14b/14c (insert pass, RC trace, merge).
     RS::RenderSettings renderSettings;
-    auto makeGiAlgo = [&renderSettings](RS::GIAlgorithmKind kind)
+    // Phase 14b: cmdline `-rcgi` boots straight into RC and enables GI.
+    {
+        LPSTR cmdLine = GetCommandLineA();
+        if (cmdLine && std::strstr(cmdLine, "-rcgi")) {
+            renderSettings.GI.Algorithm = RS::GIAlgorithmKind::RadianceCascades;
+            renderSettings.GI.Enabled   = true;
+        }
+    }
+    auto makeGiAlgo = [&renderSettings, &targets](RS::GIAlgorithmKind kind)
         -> std::unique_ptr<RS::IGIAlgorithm> {
         switch (kind) {
             case RS::GIAlgorithmKind::RadianceCascades: {
                 auto p = std::make_unique<RS::RadianceCascadeGI>();
                 p->SetSettings(&renderSettings.GI);
+                p->SetFrameResources(&targets, nullptr, "Artifacts/Shaders");
                 return p;
             }
             case RS::GIAlgorithmKind::SDFGI:
@@ -410,10 +437,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     const RS::SeededMaterials seeded = RS::SeedDemoMaterials(materials);
     RS_LOG_INFO("Seeded %u demo materials (Default=%u, RedPlastic=%u, "
                 "PolishedGold=%u, BrushedAluminium=%u, MatteBlackRubber=%u, "
-                "EmissiveCyan=%u)",
+                "EmissiveCyan=%u, Floor=%u)",
                 RS::SeededMaterials::kCount, seeded.Default, seeded.RedPlastic,
                 seeded.PolishedGold, seeded.BrushedAluminium,
-                seeded.MatteBlackRubber, seeded.EmissiveCyan);
+                seeded.MatteBlackRubber, seeded.EmissiveCyan, seeded.Floor);
 
     const RS::MeshHandle shaderBall = scene.InscribeMesh({ kShaderBallPath });
     glm::vec3 aabbMin(0.0f), aabbMax(0.0f);
@@ -428,6 +455,29 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     int                             gridCurrentN = 0;
     RebuildShaderBallGrid(scene, gridSlots, gridCurrentN, /*requested*/ 3,
                           shaderBall, aabbMin, aabbMax, /*forceReseed*/ false);
+
+    // Phase 11.5 — vast checker floor as a real GBuffer mesh. Shadows from any
+    // IShadowAlgorithm (PCF/PCSS/VSM) catch it automatically because every
+    // shadow record loops the InstanceRegistry. GI in Phase 14b/c picks it up
+    // the same way.
+    RS::FloorPlaneDesc floorDesc{};
+    floorDesc.HalfExtent = 500.0f;
+    floorDesc.Y          = 0.0f;
+    const RS::MeshHandle     floorMesh     = RS::FloorMeshInscribe(scene, floorDesc);
+    RS::InstanceHandle       floorInstance = 0;
+    if (floorMesh != 0) {
+        floorInstance = scene.InscribeInstance({ floorMesh, glm::mat4(1.0f) });
+        if (floorInstance != 0 && seeded.Floor != 0) {
+            scene.BindMaterial(floorInstance, 0, seeded.Floor);
+        }
+        RS_LOG_INFO("Floor: mesh=%u instance=%u material=%u",
+                    floorMesh, floorInstance, seeded.Floor);
+    }
+    RS::GBufferFloorConfig floorCfg{};
+    floorCfg.FloorInstance   = floorInstance;
+    floorCfg.CheckerSpacing  = 1.0f;
+    floorCfg.CheckerStrength = 0.85f;
+    floorCfg.DarkTintScale   = 0.55f;
 
     RS::OrbitCamera             cam;
     RS::GridSettings            gridSettings;
@@ -462,6 +512,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                 if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
                     cone->SetSDF(r->View, globalSdf.Sampler,
                                  r->AABBMin, r->AABBMax, r->MaxDist, true);
+                }
+                if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
+                    rcgi->SetSDFView(r->View, globalSdf.Sampler,
+                                     r->AABBMin, r->AABBMax, r->MaxDist, true);
                 }
             }
             RS_LOG_INFO("Phase 12: SDF cache hit for ShaderBall at %u^3", bootRes);
@@ -539,6 +593,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
                 cone->SetSDF(view, globalSdf.Sampler, aMin, aMax, md, has);
             }
+            if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
+                rcgi->SetSDFView(view, globalSdf.Sampler, aMin, aMax, md, has);
+            }
         };
         if (sdfResidencyChanged) pushSdfToConsumers();
 
@@ -552,6 +609,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             renderSettings.GI.Algorithm = static_cast<RS::GIAlgorithmKind>(requestedGiSwap);
             gi = makeGiAlgo(renderSettings.GI.Algorithm);
             gi->Initialize(vk, globalSdf);
+            // Push current SDF residency into the new algo (no-op for SDFGI).
+            pushSdfToConsumers();
             RS_LOG_INFO("GI algo swapped to %s", gi->Name());
         }
 
@@ -571,6 +630,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             // SDFConeShadow needs the current resident SDF wired in before
             // its first RecordShadowPass. Other variants ignore the call.
             pushSdfToConsumers();
+            // Same goes for the per-instance inverse-model SSBO ring.
+            pushInstanceXformsIfSDFCone();
         }
 
         // Apply Scene panel actions before recording the frame so any new
@@ -634,7 +695,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::GridPassRecord       (grid, vk, frame.Cmd, frame.ImageIndex, view, gridSettings);
         RS::GBufferPassRecord    (gbuffer, vk, frame.Cmd, frame.FrameSlot, view,
                                   RS::SceneMeshes(scene), RS::SceneInstances(scene),
-                                  materials, legacyMaterial);
+                                  materials, legacyMaterial, floorCfg);
         // After GBufferPass, identity is SHADER_READ_ONLY_OPTIMAL. RecordCopy
         // briefly transitions to TRANSFER_SRC + back so the preview pass below
         // still finds the layout it expects.
@@ -650,8 +711,33 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         frameCtx.SunColor     = glm::vec3(1.0f);
         frameCtx.SunIntensity = previewSettings.SunIntensity;
         frameCtx.FrameSlot    = frame.FrameSlot;
+        frameCtx.FrameIndex   = vk.FrameIndex;
         frameCtx.ScenePtr     = &scene;
         frameCtx.RenderExtent = vk.SwapchainExtent;
+        // GBuffer views for any pass that wants to sample them through the
+        // FrameContext rather than reach into OffscreenTargets directly.
+        {
+            const RS::OffscreenFrame& f = targets.Frames[frame.FrameSlot];
+            frameCtx.GBufferAlbedo       = f.Albedo.View;
+            frameCtx.GBufferNormal       = f.Normal.View;
+            frameCtx.GBufferRoughMetalF0 = f.RoughMetalF0.View;
+            frameCtx.GBufferEmissive     = f.Emissive.View;
+            frameCtx.GBufferDepth        = f.Depth.View;
+            frameCtx.GBufferIdentity     = f.Identity.View;
+        }
+        // Refresh per-instance inverse-model SSBO for this frame's slot.
+        // SDFCone reads this at set=2 binding 2; other variants ignore it.
+        // Pass the SDF target mesh + the first live grid ball as the "anchor"
+        // so non-ShaderBall instances (the floor) route to a correctly-scaled
+        // invModel instead of identity. Without this, the floor traces in
+        // world meters against the cm-AABB and the shadow appears 100× too
+        // large. Multi-ball floor shadows land with multi-mesh SDF (Phase 14b/16).
+        RS::InstanceHandle sdfAnchorInstance = 0;
+        for (RS::InstanceHandle h : gridSlots) {
+            if (h != 0) { sdfAnchorInstance = h; break; }
+        }
+        RS::InstanceXformBufferRefresh(instanceXforms, frame.FrameSlot, scene,
+                                       sdfBaker.TargetMesh, sdfAnchorInstance);
         shadow->RecordShadowPass(frame.Cmd, frameCtx);
 
         // Phase 14a: GI pre-frame (probe relight / hash insert) + gather. Both
@@ -668,6 +754,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                                previewSettings.Ambient,
                                previewSettings.UseIBL, previewSettings.IBLIntensity);
 
+        // Phase 14b: RC × Hash compose modulates LightHDR by GI + handles
+        // GIDebugView. SDFGI has no compose path; only RC implements it.
+        if (renderSettings.GI.Enabled) {
+            if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
+                rcgi->RecordCompose(frame.Cmd, frameCtx);
+            }
+        }
+
         const RS::SDFSliceState sdfSliceState =
             RS::SdfBakerComposeSliceState(sdfBaker, globalSdf);
         RS::GBufferPreviewRecord (preview, vk, frame.Cmd, frame.ImageIndex, frame.FrameSlot,
@@ -683,6 +777,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     gi.reset();
     shadow->Terminate         (vk);
     shadow.reset();
+    RS::InstanceXformBufferTerminate(instanceXforms, vk);
     RS::PickingTerminate(picking, vk);
     RS::GBufferPreviewTerminate(preview, vk);
     RS::GBufferPassTerminate   (gbuffer, vk);

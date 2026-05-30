@@ -164,7 +164,13 @@ function Find-ShaderCompiler {
 }
 
 function Compile-ShaderIfNeeded {
-    param([string]$ShaderCompiler, [string]$SourcePath, [string]$OutputPath)
+    param(
+        [string]$ShaderCompiler,
+        [string]$SourcePath,
+        [string]$OutputPath,
+        [string]$IncludeDir = "",
+        [datetime]$LatestIncludeTimeUtc
+    )
     $needsCompile = $false
     if (-not (Test-Path -LiteralPath $OutputPath)) {
         $needsCompile = $true
@@ -172,13 +178,22 @@ function Compile-ShaderIfNeeded {
         $sourceTime = (Get-Item -LiteralPath $SourcePath).LastWriteTimeUtc
         $outputTime = (Get-Item -LiteralPath $OutputPath).LastWriteTimeUtc
         if ($sourceTime -gt $outputTime) { $needsCompile = $true }
+        elseif ($LatestIncludeTimeUtc -and $LatestIncludeTimeUtc -gt $outputTime) {
+            # Any include changed → recompile. Cheap insurance: glslangValidator
+            # has no built-in dep tracking, so we mtime-fan the include dir.
+            $needsCompile = $true
+        }
     }
     if (-not $needsCompile) {
         Write-Host "[SKIP]  Shader $(Split-Path $SourcePath -Leaf)"
         return
     }
     Write-Host "[BUILD] Shader $(Split-Path $SourcePath -Leaf)"
-    $shaderOutput = & $ShaderCompiler -V $SourcePath -o $OutputPath 2>&1
+    $compileArgs = @("-V", $SourcePath, "-o", $OutputPath)
+    if ($IncludeDir -and (Test-Path -LiteralPath $IncludeDir)) {
+        $compileArgs += @("-I$IncludeDir")
+    }
+    $shaderOutput = & $ShaderCompiler @compileArgs 2>&1
     foreach ($line in $shaderOutput) {
         if ($line) { Write-Host "       $line" }
     }
@@ -247,19 +262,34 @@ try {
     $shaderCompiler = Find-ShaderCompiler -VulkanDirectory $vulkanDir
     if ($shaderCompiler) {
         Write-Info "Using shader compiler: $shaderCompiler"
-        $shaderDir = Join-Path $scriptRoot "Shaders"
+        $shaderDir   = Join-Path $scriptRoot "Shaders"
+        $includeDir  = Join-Path $shaderDir "include"
+        # Newest mtime in the include tree. glslangValidator has no dep file, so
+        # we treat "any include changed" as "every .comp/.vert/.frag may have
+        # changed" and let the per-file mtime check below short-circuit.
+        $latestInc = [datetime]::MinValue
+        if (Test-Path -LiteralPath $includeDir) {
+            $incFiles = Get-ChildItem -LiteralPath $includeDir -Recurse -File `
+                -Include *.glsl,*.h,*.glslh -ErrorAction SilentlyContinue
+            foreach ($f in $incFiles) {
+                if ($f.LastWriteTimeUtc -gt $latestInc) { $latestInc = $f.LastWriteTimeUtc }
+            }
+        }
         if (Test-Path -LiteralPath $shaderDir) {
             Get-ChildItem -LiteralPath $shaderDir -Filter "*.comp" -File | ForEach-Object {
                 $output = Join-Path $shaderOutDir ("{0}.spv" -f $_.BaseName)
-                Compile-ShaderIfNeeded -ShaderCompiler $shaderCompiler -SourcePath $_.FullName -OutputPath $output
+                Compile-ShaderIfNeeded -ShaderCompiler $shaderCompiler -SourcePath $_.FullName `
+                    -OutputPath $output -IncludeDir $shaderDir -LatestIncludeTimeUtc $latestInc
             }
             Get-ChildItem -LiteralPath $shaderDir -Filter "*.vert" -File | ForEach-Object {
                 $output = Join-Path $shaderOutDir ("{0}_vert.spv" -f $_.BaseName)
-                Compile-ShaderIfNeeded -ShaderCompiler $shaderCompiler -SourcePath $_.FullName -OutputPath $output
+                Compile-ShaderIfNeeded -ShaderCompiler $shaderCompiler -SourcePath $_.FullName `
+                    -OutputPath $output -IncludeDir $shaderDir -LatestIncludeTimeUtc $latestInc
             }
             Get-ChildItem -LiteralPath $shaderDir -Filter "*.frag" -File | ForEach-Object {
                 $output = Join-Path $shaderOutDir ("{0}_frag.spv" -f $_.BaseName)
-                Compile-ShaderIfNeeded -ShaderCompiler $shaderCompiler -SourcePath $_.FullName -OutputPath $output
+                Compile-ShaderIfNeeded -ShaderCompiler $shaderCompiler -SourcePath $_.FullName `
+                    -OutputPath $output -IncludeDir $shaderDir -LatestIncludeTimeUtc $latestInc
             }
         }
     } else {
@@ -281,6 +311,7 @@ try {
         "Source\Renderer\GridPass.cpp",
         "Source\Renderer\GBufferPreview.cpp",
         "Source\Renderer\Picking.cpp",
+        "Source\Renderer\InstanceXformBuffer.cpp",
         "Source\Shadow\ShadowMap.cpp",
         "Source\Shadow\PCFShadow.cpp",
         "Source\Shadow\PCSSShadow.cpp",
@@ -288,6 +319,7 @@ try {
         "Source\Shadow\SDFConeShadow.cpp",
         "Source\GI\SDFGI.cpp",
         "Source\GI\RadianceCascadeGI.cpp",
+        "Source\GI\RadianceCascadeHash.cpp",
         "Source\GI\ProbeDebug.cpp",
         "Source\SDF\MeshSDFBaker.cpp",
         "Source\SDF\GlobalSDF.cpp",
@@ -300,6 +332,7 @@ try {
         "Source\Scene\InstanceRegistry.cpp",
         "Source\Scene\ObjLoader.cpp",
         "Source\Scene\Scene.cpp",
+        "Source\Scene\FloorMesh.cpp",
         "Source\Camera\OrbitCamera.cpp",
         "Source\UI\ImGuiPanel.cpp",
         "Source\UI\ImGuiContextRS.cpp",
