@@ -140,7 +140,10 @@ void main() {
     bool tracingOn = (ualgo.Flags.x > 0.5) && (ualgo.Flags.y > 0.5) && NdotL > 0.0;
     if (tracingOn) {
         // Step off the surface along N (in world space) before mapping in.
-        vec3 roWorld = worldPos + N * ualgo.AABBMaxAndSurfaceOff.w;
+        // We add a light-direction bias and slope scale to prevent shadow acne
+        // (jittering spots) where the ray starts inside an interpolated voxel.
+        float slopeScale = 1.0 + max(0.0, 1.0 - NdotL) * 2.0;
+        vec3 roWorld = worldPos + N * (ualgo.AABBMaxAndSurfaceOff.w * slopeScale) + L * (ualgo.AABBMaxAndSurfaceOff.w * 0.5);
         
         float minVis = 1.0;
         uint count = min(uXforms.sdfInstanceCount, 256u);

@@ -147,6 +147,78 @@ void DestroyResident(VkDevice device, ResidentSDF& r) {
     r = ResidentSDF{};
 }
 
+void DestroyResidentSparse(VkDevice device, ResidentSparseSDF& r) {
+    if (r.IndexBuffer) vkDestroyBuffer(device, r.IndexBuffer, nullptr);
+    if (r.IndexMemory) vkFreeMemory   (device, r.IndexMemory, nullptr);
+    if (r.PoolBuffer)  vkDestroyBuffer(device, r.PoolBuffer,  nullptr);
+    if (r.PoolMemory)  vkFreeMemory   (device, r.PoolMemory,  nullptr);
+    r = ResidentSparseSDF{};
+}
+
+// Create a device-local SSBO + matching staging buffer, copy via one-shot.
+// Returns true on success. Used by sparse upload for both index + pool buffers.
+bool CreateDeviceSSBO(const VulkanContext& ctx, VkDeviceSize bytes,
+                      VkBuffer& outBuf, VkDeviceMemory& outMem) {
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size        = bytes;
+    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(ctx.Device, &bci, nullptr, &outBuf) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(ctx.Device, outBuf, &req);
+    const int memType = FindMemoryType(ctx.PhysicalDevice, req.memoryTypeBits,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memType < 0) return false;
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize  = req.size;
+    mai.memoryTypeIndex = static_cast<uint32_t>(memType);
+    if (vkAllocateMemory(ctx.Device, &mai, nullptr, &outMem) != VK_SUCCESS) return false;
+    vkBindBufferMemory(ctx.Device, outBuf, outMem, 0);
+    return true;
+}
+
+void SubmitBufferCopy(const VulkanContext& ctx, VkBuffer src, VkBuffer dst,
+                      VkDeviceSize bytes) {
+    VkCommandBufferAllocateInfo cai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cai.commandPool        = ctx.CommandPool;
+    cai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(ctx.Device, &cai, &cmd) != VK_SUCCESS) return;
+
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    VkBufferCopy region{};
+    region.size = bytes;
+    vkCmdCopyBuffer(cmd, src, dst, 1, &region);
+
+    // Make the upload visible to compute + fragment reads.
+    VkBufferMemoryBarrier bmb{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    bmb.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bmb.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT;
+    bmb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bmb.buffer              = dst;
+    bmb.size                = bytes;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 1, &bmb, 0, nullptr);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cmd;
+    vkQueueSubmit(ctx.GraphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(ctx.GraphicsQueue);
+    vkFreeCommandBuffers(ctx.Device, ctx.CommandPool, 1, &cmd);
+}
+
 uint64_t HashResidency(MeshHandle mesh, uint32_t res,
                        const glm::vec3& aabbMin, const glm::vec3& aabbMax) {
     uint64_t h = 1469598103934665603ull;
@@ -212,6 +284,8 @@ void GlobalSDFTerminate(GlobalSDF& g, const VulkanContext& ctx) {
     vkDeviceWaitIdle(ctx.Device);
     for (auto& kv : g.Resident) DestroyResident(ctx.Device, kv.second);
     g.Resident.clear();
+    for (auto& kv : g.ResidentSparse) DestroyResidentSparse(ctx.Device, kv.second);
+    g.ResidentSparse.clear();
 
     if (g.DummyView)   vkDestroyImageView(ctx.Device, g.DummyView,   nullptr);
     if (g.DummyImage)  vkDestroyImage    (ctx.Device, g.DummyImage,  nullptr);
@@ -309,6 +383,105 @@ bool GlobalSDFSaveResidentToCache(const GlobalSDF& g, MeshHandle mesh,
     // path's save instead".
     (void)g; (void)mesh; (void)sourcePath;
     return false;
+}
+
+// ---- sparse VDB-style residency --------------------------------------------
+
+const ResidentSparseSDF* GlobalSDFGetSparse(const GlobalSDF& g, MeshHandle mesh) {
+    auto it = g.ResidentSparse.find(mesh);
+    if (it == g.ResidentSparse.end()) return nullptr;
+    return &it->second;
+}
+
+void GlobalSDFEvictSparse(GlobalSDF& g, const VulkanContext& ctx, MeshHandle mesh) {
+    auto it = g.ResidentSparse.find(mesh);
+    if (it == g.ResidentSparse.end()) return;
+    vkDeviceWaitIdle(ctx.Device);
+    DestroyResidentSparse(ctx.Device, it->second);
+    g.ResidentSparse.erase(it);
+    RS_LOG_INFO("GlobalSDF: evicted sparse mesh %u", mesh);
+}
+
+ResidentSparseSDF GlobalSDFUploadSparse(GlobalSDF& g, const VulkanContext& ctx,
+                                        MeshHandle mesh,
+                                        const BakedSparseSDF& baked,
+                                        bool fromCache) {
+    if (!g.Initialized || mesh == 0 || baked.Resolution == 0 ||
+        baked.BrickIndex.empty()) {
+        return ResidentSparseSDF{};
+    }
+
+    auto existing = g.ResidentSparse.find(mesh);
+    if (existing != g.ResidentSparse.end()) {
+        vkDeviceWaitIdle(ctx.Device);
+        DestroyResidentSparse(ctx.Device, existing->second);
+        g.ResidentSparse.erase(existing);
+    }
+
+    ResidentSparseSDF r{};
+    r.AABBMin            = baked.AABBMin;
+    r.AABBMax            = baked.AABBMax;
+    r.Resolution         = baked.Resolution;
+    r.BrickSize          = baked.BrickSize;
+    r.BrickGrid          = baked.BrickGrid;
+    r.OccupiedBrickCount = baked.OccupiedBrickCount;
+    r.MaxDist            = baked.MaxDist;
+    r.FromCache          = fromCache;
+
+    const VkDeviceSize indexBytes = sizeof(uint32_t) * baked.BrickIndex.size();
+    const VkDeviceSize poolBytes  = baked.BrickPool.empty()
+        ? sizeof(int16_t)   // 0-byte SSBOs are invalid; one int16 stub keeps Vulkan happy
+        : sizeof(int16_t) * baked.BrickPool.size();
+    r.IndexBytes = indexBytes;
+    r.PoolBytes  = poolBytes;
+
+    if (!CreateDeviceSSBO(ctx, indexBytes, r.IndexBuffer, r.IndexMemory)) {
+        RS_LOG_ERROR("GlobalSDF: sparse index SSBO alloc failed (%llu B)",
+                     static_cast<unsigned long long>(indexBytes));
+        return ResidentSparseSDF{};
+    }
+    if (!CreateDeviceSSBO(ctx, poolBytes, r.PoolBuffer, r.PoolMemory)) {
+        RS_LOG_ERROR("GlobalSDF: sparse pool SSBO alloc failed (%llu B)",
+                     static_cast<unsigned long long>(poolBytes));
+        DestroyResidentSparse(ctx.Device, r);
+        return ResidentSparseSDF{};
+    }
+
+    // Staging copies.
+    auto stage = [&](const void* src, VkDeviceSize bytes, VkBuffer dst) -> bool {
+        VkBuffer staging = VK_NULL_HANDLE; VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+        if (!CreateHostBuffer(ctx, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              staging, stagingMem)) return false;
+        void* mapped = nullptr;
+        vkMapMemory(ctx.Device, stagingMem, 0, bytes, 0, &mapped);
+        if (src) std::memcpy(mapped, src, static_cast<size_t>(bytes));
+        else     std::memset(mapped, 0, static_cast<size_t>(bytes));   // stub case
+        vkUnmapMemory(ctx.Device, stagingMem);
+        SubmitBufferCopy(ctx, staging, dst, bytes);
+        vkDestroyBuffer(ctx.Device, staging,    nullptr);
+        vkFreeMemory   (ctx.Device, stagingMem, nullptr);
+        return true;
+    };
+
+    if (!stage(baked.BrickIndex.data(), indexBytes, r.IndexBuffer)) {
+        DestroyResidentSparse(ctx.Device, r);
+        return ResidentSparseSDF{};
+    }
+    if (!stage(baked.BrickPool.empty() ? nullptr : baked.BrickPool.data(),
+               poolBytes, r.PoolBuffer)) {
+        DestroyResidentSparse(ctx.Device, r);
+        return ResidentSparseSDF{};
+    }
+
+    g.ResidentSparse.emplace(mesh, r);
+    RS_LOG_INFO("GlobalSDF: uploaded sparse mesh %u (%u^3 b%u, %u/%u bricks, idx=%llu KB, pool=%llu KB, %s)",
+                mesh, baked.Resolution, baked.BrickSize,
+                baked.OccupiedBrickCount,
+                static_cast<uint32_t>(baked.BrickIndex.size()),
+                static_cast<unsigned long long>(indexBytes / 1024),
+                static_cast<unsigned long long>(poolBytes / 1024),
+                fromCache ? "from cache" : "fresh bake");
+    return r;
 }
 
 } // namespace RS

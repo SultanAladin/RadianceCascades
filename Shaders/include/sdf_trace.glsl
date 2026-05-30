@@ -88,8 +88,6 @@ float SDF_SoftShadow(sampler3D sdfTex,
     if (t > maxDist) return 1.0;
 
     float res = 1.0;
-    float ph  = 1e10;   // sentinel "previous-step distance" → y≈0 on first iter
-
     for (int i = 0; i < maxSteps; ++i) {
         if (t > maxDist) break;
         float h = SDF_Sample(sdfTex, ro + rd * t, aabbMin, aabbMax, decodeScale);
@@ -97,17 +95,20 @@ float SDF_SoftShadow(sampler3D sdfTex,
             break;
         }
         if (h < 0.001) return 0.0;
-        // IQ improved form: y = h^2/(2*ph) is the back-projected distance,
-        // w = sqrt(h^2 - y^2) is the tangential component. k is the penumbra
-        // coefficient (1/tan(angle)); larger k -> sharper.
-        float y = h * h / (2.0 * ph);
-        float w = sqrt(max(h * h - y * y, 0.0));
-        float denom = max(t - y, 1e-4);
-        res = min(res, k * w / denom);
-        ph  = h;
+        
+        // Classic IQ soft shadow form. We drop the improved back-projection
+        // (y = h^2/(2*ph)) because tri-linear interpolation of a discrete
+        // voxel SDF breaks the exact Eikonal distance property (|grad| != 1).
+        // This causes h to fluctuate non-monotonically, breaking the w term
+        // and causing extreme banding / noisy "hazy spots" in the penumbra.
+        // The classic form is much more robust to voxel SDFs.
+        res = min(res, k * h / max(t, 1e-4));
         t  += max(h, minStep);
     }
-    return clamp(res, 0.0, 1.0);
+    
+    // Smoothstep to soften the hard transitions at the penumbra edges
+    res = clamp(res, 0.0, 1.0);
+    return res * res * (3.0 - 2.0 * res);
 }
 
 // -----------------------------------------------------------------------------

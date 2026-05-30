@@ -17,6 +17,9 @@ namespace RS {
 
 namespace {
 
+constexpr int kBrickSizes[3] = { 4, 8, 16 };
+const char* kBrickSizeLabels[3] = { "4^3 (fine)", "8^3 (NanoVDB default)", "16^3 (coarse)" };
+
 constexpr int kResolutions[7] = { 32, 64, 96, 128, 256, 512, 1024 };
 const char* kResolutionLabels[7] = { "32^3", "64^3", "96^3", "128^3",
                                      "256^3 (heavy)", "512^3 (very heavy)", "1024^3 (extreme)" };
@@ -98,6 +101,21 @@ std::string ComposeOutputPath(const SdfBakerState& s, uint32_t resolution) {
     char tail[64];
     std::snprintf(tail, sizeof(tail), "_%u.rsdf", resolution);
     return std::string(dir) + "/" + name + tail;
+}
+
+std::string ComposeSparseOutputPath(const SdfBakerState& s, uint32_t resolution,
+                                    uint32_t brickSize) {
+    const char* dir  = s.OutputDirBuf[0]  ? s.OutputDirBuf.data()  : "Cache/SDF";
+    const char* name = s.OutputNameBuf[0] ? s.OutputNameBuf.data() : "mesh";
+    char tail[64];
+    std::snprintf(tail, sizeof(tail), "_%u_b%u.rsdfvdb", resolution, brickSize);
+    return std::string(dir) + "/" + name + tail;
+}
+
+uint32_t BrickSizePx(int brickSizeChoice) {
+    const int idx = std::clamp(brickSizeChoice, 0,
+                               static_cast<int>(IM_ARRAYSIZE(kBrickSizes)) - 1);
+    return static_cast<uint32_t>(kBrickSizes[idx]);
 }
 
 int FindMemoryType(VkPhysicalDevice pd, uint32_t typeBits, VkMemoryPropertyFlags want) {
@@ -460,6 +478,31 @@ void FinaliseBake(SdfBakerState& s, const VulkanContext& ctx, GlobalSDF& globalS
     RefreshStatsFromBaked(s, *s.PendingUpload, /*fromCache*/ false,
                           durationMs, triCount, savedPath);
 
+    // Sparse VDB-style follow-on. Build from the dense voxels in memory (no
+    // re-walking the BVH), save to .rsdfvdb, and upload to the sparse residency
+    // table alongside the dense one.
+    if (s.UseSparse && r.Image != VK_NULL_HANDLE) {
+        const uint32_t brickSize = BrickSizePx(s.BrickSizeChoice);
+        BakedSparseSDF sparse = SDFCacheBuildSparse(*s.PendingUpload, brickSize);
+        if (sparse.Resolution != 0) {
+            const std::string sparsePath = ComposeSparseOutputPath(s,
+                sparse.Resolution, sparse.BrickSize);
+            EnsureDirRecursive(s.OutputDirBuf.data());
+            const bool sparseSaved = SDFCacheSaveSparse(sparsePath.c_str(), sparse);
+            const ResidentSparseSDF rs = GlobalSDFUploadSparse(globalSdf, ctx,
+                                                               s.TargetMesh, sparse,
+                                                               /*fromCache*/ false);
+            s.Stats.SparseValid           = (rs.IndexBuffer != VK_NULL_HANDLE);
+            s.Stats.SparseBrickSize       = sparse.BrickSize;
+            s.Stats.SparseOccupiedBricks  = sparse.OccupiedBrickCount;
+            s.Stats.SparseTotalBricks     = static_cast<uint32_t>(sparse.BrickIndex.size());
+            s.Stats.SparseGpuBytes        = rs.IndexBytes + rs.PoolBytes;
+            s.Stats.SparseDiskBytes       = sparseSaved
+                ? QueryFileSize(sparsePath.c_str()) : 0u;
+            s.Stats.SparseLastSavedPath   = sparseSaved ? sparsePath : std::string{};
+        }
+    }
+
     s.PendingUpload.reset();
     s.Progress.reset();
 }
@@ -587,6 +630,25 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
                           "Gradient mag: |∇SDF| (should be ≈1 for clean bakes).");
     }
 
+    // Sparse VDB-style storage -------------------------------------------
+    ImGui::Separator();
+    ImGui::TextUnformatted("Sparse storage (VDB-style)");
+    ImGui::Checkbox("Build sparse .rsdfvdb alongside dense .rsdf", &s.UseSparse);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Hand-rolled 2-level brick container.\n"
+                          "Empty bricks compress to sentinel indices (no payload).\n"
+                          "Typical compression on shaderBall_256: 4-7x.");
+    }
+    ImGui::BeginDisabled(!s.UseSparse);
+    ImGui::Combo("Brick size", &s.BrickSizeChoice, kBrickSizeLabels,
+                 IM_ARRAYSIZE(kBrickSizeLabels));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("4^3: finer sparsity, more index overhead. Good for thin geometry.\n"
+                          "8^3: NanoVDB default. Balanced.\n"
+                          "16^3: coarser sparsity, less indirection. Better for blobby meshes.");
+    }
+    ImGui::EndDisabled();
+
     // Output target ------------------------------------------------------
     SeedOutputBuffersFromMesh(s);
     ImGui::Separator();
@@ -598,6 +660,11 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
     const uint32_t plannedRes = SdfBakerResolutionPx(s);
     const std::string plannedPath = ComposeOutputPath(s, plannedRes);
     ImGui::TextDisabled("→ %s", plannedPath.c_str());
+    if (s.UseSparse) {
+        const uint32_t bs = BrickSizePx(s.BrickSizeChoice);
+        const std::string sparsePath = ComposeSparseOutputPath(s, plannedRes, bs);
+        ImGui::TextDisabled("→ %s", sparsePath.c_str());
+    }
 
     // Action buttons -----------------------------------------------------
     ImGui::Separator();
@@ -731,6 +798,32 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
             const double q = (s.Stats.MaxDist > 0.0f)
                 ? static_cast<double>(s.Stats.MaxDist) / 32767.0 : 0.0;
             ImGui::Text("R16 step     : %.6f world units", q);
+
+            if (s.Stats.SparseValid) {
+                ImGui::Separator();
+                ImGui::TextUnformatted("Sparse (.rsdfvdb)");
+                ImGui::Text("Brick size   : %u^3", s.Stats.SparseBrickSize);
+                ImGui::Text("Bricks       : %u / %u occupied (%.1f%%)",
+                            s.Stats.SparseOccupiedBricks,
+                            s.Stats.SparseTotalBricks,
+                            s.Stats.SparseTotalBricks
+                                ? (100.0 * s.Stats.SparseOccupiedBricks
+                                   / double(s.Stats.SparseTotalBricks))
+                                : 0.0);
+                FormatBytes(s.Stats.SparseGpuBytes, buf, sizeof(buf));
+                ImGui::Text("Sparse VRAM  : %s (idx+pool SSBOs)", buf);
+                if (s.Stats.SparseDiskBytes > 0) {
+                    FormatBytes(s.Stats.SparseDiskBytes, buf, sizeof(buf));
+                    ImGui::Text("On disk      : %s", buf);
+                    ImGui::TextDisabled("%s", s.Stats.SparseLastSavedPath.c_str());
+                }
+                if (s.Stats.GpuBytes > 0 && s.Stats.SparseGpuBytes > 0) {
+                    const double ratio = double(s.Stats.GpuBytes)
+                                       / double(s.Stats.SparseGpuBytes);
+                    ImGui::Text("Compression  : %.2fx vs dense R16 3D image",
+                                ratio);
+                }
+            }
         }
     }
 

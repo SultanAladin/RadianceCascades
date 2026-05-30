@@ -39,6 +39,28 @@ struct ResidentSDF {
     bool           FromCache  = false;
 };
 
+// Sparse-brick residency. Two device-local SSBOs (BrickIndex + BrickPool),
+// plus a small uniform parameter block that the sampler shader include reads.
+struct ResidentSparseSDF {
+    VkBuffer       IndexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory IndexMemory = VK_NULL_HANDLE;
+    VkDeviceSize   IndexBytes  = 0;
+
+    VkBuffer       PoolBuffer  = VK_NULL_HANDLE;
+    VkDeviceMemory PoolMemory  = VK_NULL_HANDLE;
+    VkDeviceSize   PoolBytes   = 0;
+
+    glm::vec3      AABBMin     = glm::vec3(0.0f);
+    glm::vec3      AABBMax     = glm::vec3(0.0f);
+    uint32_t       Resolution         = 0;
+    uint32_t       BrickSize          = 0;
+    uint32_t       BrickGrid          = 0;
+    uint32_t       OccupiedBrickCount = 0;
+    float          MaxDist            = 0.0f;
+
+    bool           FromCache = false;
+};
+
 struct GlobalSDF {
     VkSampler Sampler = VK_NULL_HANDLE;
 
@@ -50,7 +72,8 @@ struct GlobalSDF {
     VkDeviceMemory DummyMemory = VK_NULL_HANDLE;
     VkImageView    DummyView   = VK_NULL_HANDLE;
 
-    std::unordered_map<MeshHandle, ResidentSDF> Resident;
+    std::unordered_map<MeshHandle, ResidentSDF>       Resident;
+    std::unordered_map<MeshHandle, ResidentSparseSDF> ResidentSparse;
 
     bool Initialized = false;
 };
@@ -78,6 +101,20 @@ ResidentSDF GlobalSDFUploadBaked(GlobalSDF& g, const VulkanContext& ctx,
 bool GlobalSDFTryLoadFromCache(GlobalSDF& g, const VulkanContext& ctx,
                                MeshHandle mesh, const char* sourcePath,
                                uint32_t resolution);
+
+// ---- sparse VDB-style residency --------------------------------------------
+
+const ResidentSparseSDF* GlobalSDFGetSparse(const GlobalSDF& g, MeshHandle mesh);
+
+void GlobalSDFEvictSparse(GlobalSDF& g, const VulkanContext& ctx, MeshHandle mesh);
+
+// Upload a sparse-baked SDF. Replaces any existing sparse residency for the
+// mesh. The dense residency for the same mesh, if any, is untouched — they
+// can coexist (consumer picks which to sample).
+ResidentSparseSDF GlobalSDFUploadSparse(GlobalSDF& g, const VulkanContext& ctx,
+                                       MeshHandle mesh,
+                                       const BakedSparseSDF& baked,
+                                       bool fromCache);
 
 // Write the currently-resident SDF for `mesh` back to disk at the canonical
 // Cache/SDF path. No-op if nothing is resident. Returns true on success.

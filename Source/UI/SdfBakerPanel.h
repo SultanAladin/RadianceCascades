@@ -39,6 +39,12 @@ struct SdfBakerState {
     bool     ShowSlicePreview = true;
     float    SlicePlaneY01    = 0.5f; // 0..1 across the SDF AABB
 
+    // Sparse (VDB-style) storage. When enabled, after the dense bake the panel
+    // also builds a BakedSparseSDF and saves it as <name>_<res>_b<brick>.rsdfvdb.
+    // The dense .rsdf is still written so existing consumers keep working.
+    bool     UseSparse        = false;
+    int      BrickSizeChoice  = 1;   // index into {4, 8, 16}
+
     // Per-mesh state. Phase 12 only has ShaderBall so a flat vector is plenty.
     MeshHandle TargetMesh = 0;       // resolved from picked instance / dropdown
     const char* TargetSourcePath = nullptr;  // OBJ path, owned by Main.cpp
@@ -88,6 +94,15 @@ struct SdfBakerState {
         uint32_t TriangleCount  = 0;
         float    MaxDist        = 0.0f;
         std::string LastSavedPath;          // last successful save destination
+
+        // Sparse stats (populated only when UseSparse was on for this bake).
+        bool     SparseValid    = false;
+        uint32_t SparseBrickSize       = 0;
+        uint32_t SparseOccupiedBricks  = 0;
+        uint32_t SparseTotalBricks     = 0;
+        uint64_t SparseDiskBytes       = 0;
+        uint64_t SparseGpuBytes        = 0;  // BrickIndex + BrickPool combined
+        std::string SparseLastSavedPath;
     } Stats;
 };
 

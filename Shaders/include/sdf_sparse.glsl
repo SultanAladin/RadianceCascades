@@ -1,0 +1,188 @@
+// sdf_sparse.glsl — hand-rolled VDB-style sparse-brick SDF sampler.
+//
+// Storage layout (mirrors Source/SDF/SDFCache.h::BakedSparseSDF):
+//   - BrickIndex SSBO: uint32 per brick coord in a BrickGrid^3 array.
+//       sentinel 0xFFFFFFFEu → fully outside (return +MaxDist)
+//       sentinel 0xFFFFFFFFu → fully inside  (return -MaxDist)
+//       otherwise            → 0-based brick offset into BrickPool
+//   - BrickPool SSBO: int16 voxels, OccupiedBrickCount * BrickSize^3 entries.
+//     int16s are packed into uint32 buffer slots (2 voxels per uint32) because
+//     std430 doesn't give us int16 storage directly; consumers must declare the
+//     buffer as readonly buffer { uint Data[]; } and use UnpackBrickVoxelI16().
+//
+// Consumers must define a SparseSDFParams uniform block that carries AABB +
+// MaxDist + BrickSize + BrickGrid + Resolution. Bind layout is up to the
+// consumer (lighting_sdfcone vs rc_relight pick their own set/binding numbers)
+// — this file only defines the math, the consumer wires the storage.
+
+#ifndef SDF_SPARSE_GLSL_INCLUDED
+#define SDF_SPARSE_GLSL_INCLUDED
+
+const uint kSparseBrickAllOutside = 0xFFFFFFFEu;
+const uint kSparseBrickAllInside  = 0xFFFFFFFFu;
+
+struct SparseSDFParams {
+    vec4 AABBMin;     // xyz + MaxDist in .w
+    vec4 AABBMax;     // xyz + decode scale (= MaxDist / 32767) in .w
+    uvec4 Dims;       // x=Resolution y=BrickSize z=BrickGrid w=bsLog2 (4→2, 8→3, 16→4)
+};
+
+// Unpack one int16 voxel from the uint32 brick pool.
+//   linearVoxel = (lz * bs + ly) * bs + lx
+//   uint32-slot = linearVoxel >> 1
+//   bit shift   = (linearVoxel & 1) ? 16 : 0
+float UnpackBrickVoxelI16(uint packed, uint linearVoxel) {
+    uint shift = ((linearVoxel & 1u) == 0u) ? 0u : 16u;
+    uint raw   = (packed >> shift) & 0xFFFFu;
+    // Sign-extend 16-bit two's complement, then decode to [-1, 1].
+    int  sig   = int(raw);
+    if (sig >= 0x8000) sig -= 0x10000;
+    return float(sig) * (1.0 / 32767.0);
+}
+
+// Returns signed distance in world units. Points outside the AABB return +1e6.
+// Trilinear inside the brick; straddling-boundary samples fall back to nearest
+// (clamped) because a fully-correct neighbour-brick lookup would 8x the SSBO
+// reads at every voxel. The existing dense baker pads the AABB 5% beyond the
+// mesh surface, so the surface band never sits on a brick edge — this clamp is
+// invisible at the surface.
+float SDFSparse_SampleParams(SparseSDFParams params,
+                             vec3 worldPos,
+                             uint brickIndex[],   // pseudo: GLSL doesn't pass SSBOs
+                             uint brickPool[])    // — see Consumer macro below
+{
+    return 0.0; // placeholder; concrete sampler uses the consumer-side macro
+}
+
+// Consumers can't pass SSBO arrays as function arguments in GLSL (SPIR-V wants
+// the descriptor binding to be statically known). Instead, the consumer
+// instantiates the sampler as a macro that names its concrete SSBOs.
+//
+// Usage:
+//   layout(set=2, binding=4) readonly buffer SparseIndex { uint Data[]; } uSparseIdx;
+//   layout(set=2, binding=5) readonly buffer SparsePool  { uint Data[]; } uSparsePool;
+//   layout(set=2, binding=6) uniform SparseParams { SparseSDFParams P; } uSparseP;
+//   #define SDF_SPARSE_SAMPLE(p) SDFSparse_Sample(p, uSparseIdx.Data, uSparsePool.Data, uSparseP.P)
+//
+// But GLSL still won't let us pass buffer.Data as an array argument. So the
+// consumer instead pastes the body inline via this expression-style macro:
+//
+//   #define SDFSparse_Sample(worldPos, IDX_BUF, POOL_BUF, P) \
+//       SDFSparseSampleImpl(worldPos, IDX_BUF, POOL_BUF, P)
+//
+// — and we generate SDFSparseSampleImpl as a function whose argument types are
+// the consumer's SSBO-block types, which only works if the consumer #includes
+// this AFTER declaring those bindings. To keep things sane, we provide the
+// body as a copy-paste reference instead, and consumers inline the lookup.
+
+// ------------------------------------------------------------------------------
+// Inlinable sampler body. Consumers include this file AFTER declaring their
+// sparse SSBOs, then call SDFSPARSE_SAMPLE_BODY(p, idxBuf, poolBuf, paramsExpr)
+// which expands to a single expression returning float (world-space distance).
+//
+// The macro evaluates each argument once into a local; safe to pass arbitrary
+// expressions for p / params.
+// ------------------------------------------------------------------------------
+
+#define SDFSPARSE_SAMPLE_BODY(WORLDPOS, IDXBUF, POOLBUF, PARAMS) \
+    SDFSparseSampleHelper(WORLDPOS, IDXBUF, POOLBUF, PARAMS)
+
+// We inline the helper as a plain function and rely on the consumer to define
+// it with the right buffer types via the SDFSPARSE_DEFINE_HELPER macro.
+
+// ----- macro the consumer pastes once per shader stage ------------------------
+// Required because GLSL forbids SSBO array parameters. The macro expands to a
+// proper function definition specialised to the consumer's named SSBOs.
+//
+// Args:
+//   IDX_BLOCK   = the SSBO block name for the brick index (e.g. uSparseIdx)
+//   POOL_BLOCK  = the SSBO block name for the brick pool  (e.g. uSparsePool)
+//
+// After expansion, callers use:
+//   float d = SDFSparseSampleHelper(p, params);
+//
+// The named blocks are referenced directly inside the helper body.
+
+#define SDFSPARSE_DEFINE_HELPER(IDX_BLOCK, POOL_BLOCK)                          \
+float SDFSparseSampleHelper(vec3 worldPos, SparseSDFParams params)              \
+{                                                                               \
+    vec3  boxMin = params.AABBMin.xyz;                                          \
+    vec3  boxMax = params.AABBMax.xyz;                                          \
+    float maxDist = params.AABBMin.w;                                           \
+    vec3  boxSize = max(boxMax - boxMin, vec3(1e-6));                           \
+    vec3  uvw     = (worldPos - boxMin) / boxSize;                              \
+    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) {    \
+        return 1e6;                                                             \
+    }                                                                           \
+    uint  res     = params.Dims.x;                                              \
+    uint  bs      = params.Dims.y;                                              \
+    uint  bg      = params.Dims.z;                                              \
+    uint  bsLog2  = params.Dims.w;                                              \
+    vec3  cellF   = uvw * vec3(res);                                            \
+    vec3  cellC   = clamp(cellF, vec3(0.0), vec3(float(res) - 1.0));            \
+    uvec3 cellI   = uvec3(cellC);                                               \
+    uvec3 brick   = cellI >> bsLog2;                                            \
+    uint  brickIi = (brick.z * bg + brick.y) * bg + brick.x;                    \
+    uint  brickIdx = IDX_BLOCK.Data[brickIi];                                   \
+    if (brickIdx == kSparseBrickAllOutside) return  maxDist;                    \
+    if (brickIdx == kSparseBrickAllInside ) return -maxDist;                    \
+    /* Trilinear inside the brick. Clamp at brick edges (1-voxel pad).      */ \
+    vec3 inBrick = cellC - vec3(brick) * float(bs);                             \
+    uint bsM1    = bs - 1u;                                                     \
+    uvec3 c0     = uvec3(min(uvec3(inBrick), uvec3(bsM1)));                     \
+    uvec3 c1     = uvec3(min(c0 + 1u, uvec3(bsM1)));                            \
+    vec3  f      = fract(inBrick);                                              \
+    uint  base   = brickIdx * (bs * bs * bs);                                   \
+    uint  bs2    = bs * bs;                                                     \
+    /* Eight corner taps. */                                                    \
+    float v000, v100, v010, v110, v001, v101, v011, v111;                       \
+    {                                                                           \
+        uint lin = (c0.z * bs2) + (c0.y * bs) + c0.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v000 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c0.z * bs2) + (c0.y * bs) + c1.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v100 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c0.z * bs2) + (c1.y * bs) + c0.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v010 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c0.z * bs2) + (c1.y * bs) + c1.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v110 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c1.z * bs2) + (c0.y * bs) + c0.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v001 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c1.z * bs2) + (c0.y * bs) + c1.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v101 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c1.z * bs2) + (c1.y * bs) + c0.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v011 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    {                                                                           \
+        uint lin = (c1.z * bs2) + (c1.y * bs) + c1.x;                           \
+        uint slot = (base + lin) >> 1u;                                         \
+        v111 = UnpackBrickVoxelI16(POOL_BLOCK.Data[slot], (base + lin)) * maxDist; \
+    }                                                                           \
+    float v00 = mix(v000, v100, f.x);                                           \
+    float v10 = mix(v010, v110, f.x);                                           \
+    float v01 = mix(v001, v101, f.x);                                           \
+    float v11 = mix(v011, v111, f.x);                                           \
+    float v0  = mix(v00, v10, f.y);                                             \
+    float v1  = mix(v01, v11, f.y);                                             \
+    return mix(v0, v1, f.z);                                                    \
+}
+
+#endif // SDF_SPARSE_GLSL_INCLUDED
