@@ -307,6 +307,7 @@ try {
         "Source\Renderer\Lighting.cpp",
         "Source\Renderer\SkyAtmosphere.cpp",
         "Source\Renderer\Tonemap.cpp",
+        "Source\Renderer\PerfTimers.cpp",
         "Source\Renderer\OffscreenTargets.cpp",
         "Source\Renderer\GridPass.cpp",
         "Source\Renderer\GBufferPreview.cpp",

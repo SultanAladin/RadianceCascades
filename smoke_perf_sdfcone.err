@@ -1,0 +1,24 @@
+[RS][INFO] Vulkan device: NVIDIA GeForce GTX 1650 SUPER (queue family 0)
+[RS][INFO] Swapchain: 1280x720 x 3 images, format 44
+[RS][INFO] ImGui ready: 3 framebuffers, render-pass + descriptor-pool live
+[RS][INFO] SkyAtmosphere ready: sky=256² irr=32² prefilter=128²×6mip lut=256²
+[RS][INFO] GridPass ready: 3 framebuffers
+[RS][INFO] OffscreenTargets ready: 1280x720, 2 frames
+[RS][INFO] GBufferPass ready: 2 framebuffers, 1280x720
+[RS][INFO] GlobalSDF: ready (dummy 1^3 bound)
+[RS][INFO] GBufferPreview ready: 3 framebuffers (+SDF binding)
+[RS][INFO] PickingSystem ready: 2 host-visible 8-byte readback slots
+[RS][INFO] SDFConeShadow ready (sparse VDB binding, awaiting SetSDF)
+[RS][INFO] LightingPass ready: variant=3, 1280x720
+[RS][INFO] TonemapPass ready: 1280x720
+[RS][INFO] PerfTimers ready: 44 queries (11 pass × 2 slot × 2 ts), period=1.00 ns
+[RS][INFO] Renderer::Initialize stub: render target 1280x720
+[RS][INFO] Seeded 7 demo materials (Default=0, RedPlastic=1, PolishedGold=2, BrushedAluminium=3, MatteBlackRubber=4, EmissiveCyan=5, Floor=6)
+[RS][INFO] OBJ parsed: ../ShaderBall-master/shaderBallNoCrease/shaderBall.obj -> 135792 verts, 203496 indices (67832 tris), 12 submeshes
+[RS][INFO] MeshRegistry: uploaded handle 1 (135792 verts, 203496 indices)
+[RS][INFO] MeshRegistry: uploaded handle 2 (4 verts, 6 indices)
+[RS][INFO] FloorMesh: handle 2, half-extent 500.0m at y=0.000
+[RS][INFO] Floor: mesh=2 instance=10 material=6
+[RS][INFO] GlobalSDF: uploaded sparse mesh 1 (64^3 b8, 330/512 bricks, idx=2 KB, pool=330 KB, from cache)
+[RS][INFO] GlobalSDF: uploaded mesh 1 (64^3, 512.0 KB, from cache)
+[RS][INFO] Phase 15g: SDF cache hit for ShaderBall at 64^3 (sparse + dense)

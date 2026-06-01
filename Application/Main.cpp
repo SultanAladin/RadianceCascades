@@ -19,6 +19,8 @@
 #include "Renderer/GBuffer.h"
 #include "Renderer/GBufferPreview.h"
 #include "Renderer/Lighting.h"
+#include "Renderer/Tonemap.h"
+#include "Renderer/PerfTimers.h"
 #include "Renderer/OffscreenTargets.h"
 #include "Renderer/Picking.h"
 #include "Renderer/InstanceXformBuffer.h"
@@ -41,6 +43,7 @@
 #include "UI/ImGuiPanel.h"
 #include "UI/RenderSettingsPanel.h"
 #include "UI/SdfBakerPanel.h"
+#include "UI/PerfWidget.h"
 #include "imgui.h"
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -136,6 +139,20 @@ int DrawShadowsPanel(RS::IShadowAlgorithm& active) {
     }
     ImGui::End();
     return requestedSwap;
+}
+
+void DrawTonemapPanel(RS::TonemapSettings& t) {
+    ImGui::SetNextWindowPos (ImVec2(16.0f, 710.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320.0f, 140.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Tonemap")) {
+        ImGui::SliderFloat("Exposure (EV)", &t.ExposureEV, -4.0f, 4.0f);
+        ImGui::Checkbox("ACES (Narkowicz)",  &t.AcesEnabled);
+        ImGui::SameLine();
+        ImGui::Checkbox("sRGB gamma",        &t.GammaEnabled);
+        ImGui::TextDisabled("In-place on LightHDR. Swapchain is _UNORM, so the\n"
+                            "sRGB encode lives here (not in the framebuffer).");
+    }
+    ImGui::End();
 }
 
 void DrawDebugPanel(RS::GBufferPreviewSettings& preview) {
@@ -385,6 +402,21 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         return 10;
     }
 
+    RS::TonemapPass tonemap;
+    if (!RS::TonemapPassInitialize(tonemap, vk, targets, "Artifacts/Shaders")) {
+        RS_LOG_ERROR("TonemapPassInitialize failed");
+        return 12;
+    }
+    RS::TonemapSettings tonemapSettings;
+
+    // Phase 16: GPU timestamp ring (per-pass start/end timestamps; readback
+    // lands at the next BeginFrame on the same slot, gated on the fence wait).
+    RS::PerfTimers perfTimers;
+    if (!RS::PerfTimersInitialize(perfTimers, vk)) {
+        RS_LOG_ERROR("PerfTimersInitialize failed");
+        return 13;
+    }
+
     // Phase 14a groundwork: master RenderSettings owned by the host; GI algo
     // is hot-swappable via the Render Settings panel combo. Both algos are
     // stubs at this point (no compute work) — the wiring is what unlocks
@@ -483,6 +515,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RS::SkySettings             skySettings;
     RS::PanelSelection          panelSel;
     RS::SdfBakerState           sdfBaker;
+    RS::PerfWidgetState         perfWidget;
     RS::MeshHandle              activeSdfMesh = shaderBall;
 
     sdfBaker.TargetMesh       = shaderBall;
@@ -593,6 +626,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                                shaderBall, scene);
         DrawDebugPanel        (previewSettings);
         DrawMatcapPanel       (previewSettings.Matcap);
+        DrawTonemapPanel      (tonemapSettings);
+        RS::PerfWidgetDraw    (perfWidget, perfTimers, vk.FrameIndex);
 
         // Phase 12: SDF Baker window. Returns true if the GlobalSDF residency
         // changed this frame (bake completed, evict, load-from-disk, etc.) so
@@ -685,6 +720,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             continue;
         }
 
+        // Phase 16: reset this slot's timestamp queries + readback last cycle's.
+        // The fence wait inside VulkanContextBeginFrame already gated readback.
+        RS::PerfTimersBeginFrame(perfTimers, vk, frame.Cmd, frame.FrameSlot);
+
         // Phase 9 picking — BeginFrame has just waited this slot's fence so
         // the previous-cycle copy is GPU-complete and the host-mapped pixel
         // is safe to read.
@@ -728,17 +767,26 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // into SkySettings so the sky cube tracks the same sun the lighting
         // compose uses.
         skySettings.SunDirection = glm::normalize(previewSettings.SunDirection);
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::SkyBake);
         RS::SkyAtmosphereEnsureBaked(sky, vk, frame.Cmd, skySettings);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::SkyBake);
+
         RS::GridPassRecord       (grid, vk, frame.Cmd, frame.ImageIndex, view, gridSettings);
+
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GBuffer);
         RS::GBufferPassRecord    (gbuffer, vk, frame.Cmd, frame.FrameSlot, view,
                                   RS::SceneMeshes(scene), RS::SceneInstances(scene),
                                   materials, legacyMaterial, floorCfg);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GBuffer);
+
         // After GBufferPass, identity is SHADER_READ_ONLY_OPTIMAL. RecordCopy
         // briefly transitions to TRANSFER_SRC + back so the preview pass below
         // still finds the layout it expects.
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::PickingCopy);
         RS::PickingRecordCopy    (picking, frame.Cmd, frame.FrameSlot,
                                   targets.Frames[frame.FrameSlot].Identity.Image,
                                   targets.Extent);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::PickingCopy);
 
         // Phase 10: shadow + lighting compose. Build a FrameContext snapshot
         // so the algo + downstream callbacks see one consistent state.
@@ -775,41 +823,67 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         }
         RS::InstanceXformBufferRefresh(instanceXforms, frame.FrameSlot, scene,
                                        activeSdfMesh, sdfAnchorInstance);
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
         shadow->RecordShadowPass(frame.Cmd, frameCtx);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
 
         // Phase 14a: GI pre-frame (probe relight / hash insert) + gather. Both
         // are no-ops on the current stubs; the call sites are here so the
         // 14b/14c shader work plugs in without touching Main.cpp.
         if (renderSettings.GI.Enabled) {
+            RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GIPreFrame);
             gi->RecordPreFrame(frame.Cmd, frameCtx);
+            RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GIPreFrame);
+            RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GIGather);
             gi->RecordGather  (frame.Cmd, frameCtx);
+            RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GIGather);
         }
 
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Lighting);
         RS::LightingPassRecord(lighting, vk, frame.Cmd, frame.FrameSlot, targets,
                                *shadow, view, previewSettings.SunDirection,
                                glm::vec3(1.0f), previewSettings.SunIntensity,
                                previewSettings.Ambient,
                                previewSettings.UseIBL, previewSettings.IBLIntensity,
                                renderSettings.PBR.RealisticPbr);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Lighting);
 
         // Phase 14b: RC × Hash compose modulates LightHDR by GI + handles
         // GIDebugView. SDFGI has no compose path; only RC implements it.
         if (renderSettings.GI.Enabled) {
             if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
+                RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GICompose);
                 rcgi->RecordCompose(frame.Cmd, frameCtx);
+                RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::GICompose);
             }
         }
 
+        // Phase 16: ACES + exposure + sRGB encode, in-place over LightHDR.
+        // LightHDR comes in as SHADER_READ_ONLY_OPTIMAL (from Lighting or GI
+        // compose); Tonemap flips to GENERAL, writes, flips back.
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Tonemap);
+        RS::TonemapPassRecord(tonemap, frame.Cmd, frame.FrameSlot, targets,
+                              tonemapSettings);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Tonemap);
+
         const RS::SDFSliceState sdfSliceState =
             RS::SdfBakerComposeSliceState(sdfBaker, globalSdf);
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Preview);
         RS::GBufferPreviewRecord (preview, vk, frame.Cmd, frame.ImageIndex, frame.FrameSlot,
                                   view, previewSettings, sdfSliceState);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Preview);
+
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
         RS::ImGuiContextRSRender (gui,  vk, frame.Cmd, frame.ImageIndex);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
+
         RS::VulkanContextEndFrame(vk,   frame);
     }
 
     RS::SdfBakerTerminate     (sdfBaker, vk);
     RS::SceneDetachVulkan(scene);
+    RS::PerfTimersTerminate   (perfTimers, vk);
+    RS::TonemapPassTerminate  (tonemap,  vk);
     RS::LightingPassTerminate (lighting, vk);
     gi->Terminate();
     gi.reset();

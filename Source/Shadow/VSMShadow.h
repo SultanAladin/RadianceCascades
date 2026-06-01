@@ -28,7 +28,7 @@
 namespace RS {
 
 struct VSMParams {
-    float MinVariance         = 2.0e-5f;  // floor on variance — kills numerical noise
+    float MinVariance         = 2.0e-5f;  // floor on variance - kills numerical noise
     float LightBleedReduction = 0.20f;    // 0..1; bigger = harder shadow but tighter penumbra
     float DepthBias           = 0.001f;
     float NormalBias          = 0.02f;

@@ -1,0 +1,65 @@
+#version 450
+// Phase 16 — ACES tonemap + exposure + gamma. Runs in-place on LightHDR.
+//
+// Reads LightHDR (rgba16f, GENERAL), applies:
+//   1. exposure scale  (2^ExposureEV)
+//   2. ACES Narkowicz fit (cheap, single rational approximation)
+//   3. sRGB gamma encode (the swapchain is _UNORM, not _SRGB)
+// and writes back into LightHDR. The GBufferPreview Lit mode then samples the
+// already-tonemapped values directly — no new descriptors or images.
+//
+// Flags (Params.y, decoded via floatBitsToUint in the shader):
+//   bit 0 = TonemapEnabled
+//   bit 1 = GammaEnabled
+//
+// 8x8 dispatch over the render extent.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D uLightHDR;
+
+layout(push_constant) uniform PushConstants {
+    vec4 Params;       // x = exposure (linear, = exp2(EV)), y = flagsAsFloat, z/w unused
+    vec4 ResAndPad;    // xy = extent, zw unused
+} pc;
+
+const uint kFlagTonemap = 1u;
+const uint kFlagGamma   = 2u;
+
+// Narkowicz 2015 ACES approximation. Input/output both linear.
+vec3 ACESNarkowicz(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+vec3 LinearToSrgb(vec3 c) {
+    bvec3 cutoff = lessThan(c, vec3(0.0031308));
+    vec3 low  = c * 12.92;
+    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
+}
+
+void main() {
+    ivec2 px   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(pc.ResAndPad.xy);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    uint flags = floatBitsToUint(pc.Params.y);
+
+    vec4 hdr = imageLoad(uLightHDR, px);
+    vec3 c   = hdr.rgb * pc.Params.x;            // exposure
+
+    if ((flags & kFlagTonemap) != 0u) {
+        c = ACESNarkowicz(c);
+    } else {
+        c = clamp(c, vec3(0.0), vec3(1.0));
+    }
+    if ((flags & kFlagGamma) != 0u) {
+        c = LinearToSrgb(c);
+    }
+    imageStore(uLightHDR, px, vec4(c, hdr.a));
+}

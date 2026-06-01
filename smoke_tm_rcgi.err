@@ -1,0 +1,15 @@
+[RS][INFO] Vulkan device: NVIDIA GeForce GTX 1650 SUPER (queue family 0)
+[RS][INFO] Swapchain: 1280x720 x 3 images, format 44
+[RS][INFO] ImGui ready: 3 framebuffers, render-pass + descriptor-pool live
+[RS][INFO] SkyAtmosphere ready: sky=256² irr=32² prefilter=128²×6mip lut=256²
+[RS][INFO] GridPass ready: 3 framebuffers
+[RS][INFO] OffscreenTargets ready: 1280x720, 2 frames
+[RS][INFO] GBufferPass ready: 2 framebuffers, 1280x720
+[RS][INFO] GlobalSDF: ready (dummy 1^3 bound)
+[RS][INFO] GBufferPreview ready: 3 framebuffers (+SDF binding)
+[RS][INFO] PickingSystem ready: 2 host-visible 8-byte readback slots
+[RS][INFO] ShadowMap ready: D32_SFLOAT 2048x2048x4
+[RS][INFO] PCFShadow ready: 4 cascades @ 2048^2 D32_SFLOAT
+[RS][INFO] LightingPass ready: variant=0, 1280x720
+[RS][INFO] TonemapPass ready: 1280x720
+[RS][INFO] 
