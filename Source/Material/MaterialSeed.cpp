@@ -24,7 +24,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(0.78f, 0.78f, 0.80f);
         m.RoughnessFlat = 0.55f;
         m.MetallicFlat  = 0.0f;
-        m.F0Flat        = glm::vec3(0.04f);
+        m.F0Flat        = glm::vec3(1.0f);   // KHR specularColor (dielectric tint)
         m.EmissiveFlat  = glm::vec3(0.0f);
         SetName(m, "Default");
         s.Default = registry.Create(m);
@@ -36,7 +36,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(0.78f, 0.08f, 0.06f);
         m.RoughnessFlat = 0.40f;
         m.MetallicFlat  = 0.0f;
-        m.F0Flat        = glm::vec3(0.04f);
+        m.F0Flat        = glm::vec3(1.0f);   // KHR specularColor (dielectric tint)
         SetName(m, "Red Plastic");
         s.RedPlastic = registry.Create(m);
     }
@@ -47,7 +47,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(1.00f, 0.78f, 0.34f);
         m.RoughnessFlat = 0.10f;
         m.MetallicFlat  = 1.0f;
-        m.F0Flat        = glm::vec3(1.00f, 0.78f, 0.34f);
+        m.F0Flat        = glm::vec3(1.00f, 0.78f, 0.34f);  // ignored on metals; kept for reference
         SetName(m, "Polished Gold");
         s.PolishedGold = registry.Create(m);
     }
@@ -59,7 +59,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(0.91f, 0.92f, 0.94f);
         m.RoughnessFlat = 0.42f;
         m.MetallicFlat  = 1.0f;
-        m.F0Flat        = glm::vec3(0.91f, 0.92f, 0.94f);
+        m.F0Flat        = glm::vec3(0.91f, 0.92f, 0.94f);  // ignored on metals
         SetName(m, "Brushed Aluminium");
         s.BrushedAluminium = registry.Create(m);
     }
@@ -70,7 +70,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(0.02f, 0.02f, 0.02f);
         m.RoughnessFlat = 0.90f;
         m.MetallicFlat  = 0.0f;
-        m.F0Flat        = glm::vec3(0.04f);
+        m.F0Flat        = glm::vec3(1.0f);   // KHR specularColor (dielectric tint)
         SetName(m, "Matte Black Rubber");
         s.MatteBlackRubber = registry.Create(m);
     }
@@ -82,7 +82,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(0.0f);
         m.RoughnessFlat = 0.50f;
         m.MetallicFlat  = 0.0f;
-        m.F0Flat        = glm::vec3(0.04f);
+        m.F0Flat        = glm::vec3(1.0f);   // KHR specularColor (dielectric tint)
         m.EmissiveFlat  = glm::vec3(0.10f, 1.80f, 2.20f);
         SetName(m, "Emissive Cyan");
         s.EmissiveCyan = registry.Create(m);
@@ -96,7 +96,7 @@ SeededMaterials SeedDemoMaterials(MaterialRegistry& registry) {
         m.AlbedoFlat    = glm::vec3(0.58f, 0.58f, 0.60f);
         m.RoughnessFlat = 0.85f;
         m.MetallicFlat  = 0.0f;
-        m.F0Flat        = glm::vec3(0.04f);
+        m.F0Flat        = glm::vec3(1.0f);   // KHR specularColor (dielectric tint)
         SetName(m, "Floor");
         s.Floor = registry.Create(m);
     }

@@ -1,0 +1,59 @@
+#version 450
+// Phase B — Transmittance LUT (Hillaire 2020 §5.1.1).
+// For each (cos view-zenith, altitude ratio) texel: march from a sample point
+// to the atmosphere top edge, accumulate optical depth, output exp(-Σ).
+//
+// Static LUT — re-bakes only when atmosphere parameters change.
+// Size: 256×64, format R16G16B16A16F. Workgroup 8×8.
+
+#extension GL_GOOGLE_include_directive : require
+#include "include/atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uTransmittance;
+
+layout(push_constant) uniform Push {
+    AtmosphereParams Atmo;
+    vec4             LutSize; // x = width, y = height, z = steps, w = unused
+} pc;
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    vec2  sz = pc.LutSize.xy;
+    if (px.x >= uint(sz.x) || px.y >= uint(sz.y)) return;
+
+    AtmoCoeffs c = UnpackAtmoCoeffs(pc.Atmo);
+
+    vec2 uv = (vec2(px) + 0.5) / sz;
+    float r, mu;
+    RMuFromTransmittanceUV(uv, c.PlanetRadiusKm, c.AtmoRadiusKm, r, mu);
+
+    // March from (0, 0, r) along direction (sqrt(1-mu²), 0, mu) until the
+    // atmosphere top edge. We're in km here; convert step length to metres for
+    // the extinction integral (β is in 1/m).
+    vec3 ro = vec3(0.0, 0.0, r);
+    vec3 rd = vec3(sqrt(max(1.0 - mu * mu, 0.0)), 0.0, mu);
+
+    float tEnd = RaySphereExit(ro, rd, c.AtmoRadiusKm);
+    // If the ray clips the planet (mu deep negative at low altitude), output 0.
+    float tPlanet = RaySphereIntersectNearest(ro, rd, c.PlanetRadiusKm);
+    if (tPlanet > 0.0) tEnd = min(tEnd, tPlanet);
+
+    int   steps    = int(max(pc.LutSize.z, 8.0));
+    float dt_km    = tEnd / float(steps);
+    float dt_m     = dt_km * 1000.0;
+    vec3  opticalDepth = vec3(0.0);
+    // Trapezoidal: half-weights at endpoints. Hillaire's reference uses this
+    // — single-scatter LUT precision matters for the horizon band.
+    for (int i = 0; i <= steps; ++i) {
+        float t   = float(i) * dt_km;
+        vec3  pos = ro + rd * t;
+        float alt = AltitudeKm(pos, c.PlanetRadiusKm);
+        vec3  e   = SampleExtinction(c, alt);
+        float w   = (i == 0 || i == steps) ? 0.5 : 1.0;
+        opticalDepth += e * w * dt_m;
+    }
+    vec3 transmittance = exp(-opticalDepth);
+    imageStore(uTransmittance, ivec2(px), vec4(transmittance, 1.0));
+}

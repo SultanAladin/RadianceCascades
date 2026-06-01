@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
 // Phase 6 + 7 GBuffer preview. Picks one attachment, writes it to the swapchain.
 // Uses sampled depth as a presence mask so the grid pass behind us still shows
 // through wherever GBuffer didn't write geometry (depth==1.0).
@@ -37,8 +39,24 @@ layout(set = 0, binding = 10) uniform sampler3D  uMeshSDF;
 layout(set = 0, binding = 11) uniform SdfParams {
     vec4 AABBMinAndPlaneY;   // xyz = SDF AABB min, w = world-Y of slice plane
     vec4 AABBMaxAndMaxDist;  // xyz = SDF AABB max, w = R16_SNORM decode scale
-    vec4 PreviewParams;      // x = viz mode (float),  y/z/w = reserved
+    vec4 PreviewParams;      // x = viz mode (float), y = slice source (0=dense,1=sparse), z/w = reserved
+    // Phase 15f — sparse SDF reuses the same SparseSDFParams layout as the
+    // sphere-trace consumers so SDFSPARSE_DEFINE_HELPER works unmodified.
+    vec4 SparseAABBMin;      // xyz = sparse AABB min, w = sparse MaxDist
+    vec4 SparseAABBMax;      // xyz = sparse AABB max, w = R16_SNORM decode scale
+    uvec4 SparseDims;        // x = res, y = bs, z = bg, w = bsLog2
 } uSdf;
+// KHR_materials_specular GBuffer attachment (rgb = specularColor).
+layout(set = 0, binding = 12) uniform sampler2D  uSpecular;
+// Phase 15f — sparse VDB-style SDF (BrickIndex + BrickPool). Sphere-tracer-
+// agnostic sampling via the shared sdf_sparse.glsl macro. Always-bound (dummy
+// 16-byte buffer when no sparse residency exists), so reading slice-source=0
+// stays well-defined.
+layout(set = 0, binding = 13) readonly buffer SparseIdx  { uint Data[]; } uSparseIdx;
+layout(set = 0, binding = 14) readonly buffer SparsePool { uint Data[]; } uSparsePool;
+
+#include "include/sdf_sparse.glsl"
+SDFSPARSE_DEFINE_HELPER(uSparseIdx, uSparsePool)
 
 layout(push_constant) uniform Push {
     vec4 SunDirAndIntensity;   // xyz = direction toward sun, w = intensity
@@ -117,47 +135,26 @@ vec3 Matcap(vec3 worldN) {
 }
 
 // -- Phase 7 PBR --------------------------------------------------------------
-// Karis 2013 GGX + Schlick + Smith, sun light only, no shadows / IBL.
+// Karis 2013 GGX + Schlick + Smith — direct path. (Lit mode now usually reads
+// from LightHDR; PbrLit is a fallback / debug-mode preview that re-derives
+// direct lighting without shadows or compose.)
 
-const float kPI = 3.14159265359;
-
-float D_GGX(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / (kPI * d * d + 1e-5);
-}
-
-float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
-    float a    = roughness * roughness;
-    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
-    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
-    return 0.5 / max(ggxV + ggxL, 1e-5);
-}
-
-vec3 F_Schlick(float VdotH, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-}
-
-// Karis Fresnel-with-roughness for IBL — clamps the Fresnel grazing-angle term
-// when sampling a low-resolution prefilter, otherwise rough metals look too hot
-// at glancing angles.
-vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
-    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
+#include "include/pbr_brdf.glsl"
 
 vec3 PbrLit(vec2 uv) {
-    vec3  albedo  = texture(uAlbedo, uv).rgb;
+    vec4 albedoAO = texture(uAlbedo, uv);
+    vec3 albedo   = albedoAO.rgb;
+    float ao      = albedoAO.a;
     vec3  encN    = texture(uNormal, uv).rgb;
     vec3  rmf     = texture(uRMF,    uv).rgb;
     vec3  emiss   = texture(uEmissive, uv).rgb;
+    vec3  specCol = texture(uSpecular, uv).rgb;
     float depth   = texture(uDepth,   uv).r;
 
     vec3  N         = normalize(encN * 2.0 - 1.0);
     float roughness = max(rmf.r, 0.04);
     float metallic  = rmf.g;
-    float F0Scalar  = rmf.b;
+    float specFact  = rmf.b;
 
     // World-pos reconstruction: NDC = (uv*2-1, depth). Vulkan depth range is
     // [0,1] (GLM_FORCE_DEPTH_ZERO_TO_ONE) and our projection Y is pre-flipped
@@ -176,17 +173,21 @@ vec3 PbrLit(vec2 uv) {
     float NdotV = max(dot(N, V), 1e-3);
     float NdotH = max(dot(N, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
+    float LdotV = dot(L, V);
 
-    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    vec3 F0 = ComputeF0_KHR(albedo, metallic, specCol, specFact);
 
+    // PbrLit doesn't see the realistic-PBR flag (push-constant layout is
+    // matcap-shaped); default to classic Cook-Torrance here. The main "Lit"
+    // path reads from LightHDR which has full realistic support.
     float D = D_GGX(NdotH, roughness);
     float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
     vec3  F = F_Schlick(VdotH, F0);
 
     vec3 specular = D * Vt * F;
     vec3 kS       = F;
-    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
-    vec3 diffuse  = kD * albedo / kPI;
+    vec3 kD       = (vec3(1.0) - kS) * (1.0 - metallic);
+    vec3 diffuse  = kD * albedo * kInvPI;
 
     vec3 sunRadiance = vec3(1.0) * pc.SunDirAndIntensity.w;
     vec3 lit = (diffuse + specular) * sunRadiance * NdotL;
@@ -210,6 +211,7 @@ vec3 PbrLit(vec2 uv) {
     } else {
         ambient = albedo * pc.AmbientAndNearFar.x;
     }
+    ambient *= ao;
 
     return lit + ambient + emiss;
 }
@@ -222,10 +224,23 @@ vec3 PbrLit(vec2 uv) {
 //   positive (outside)→ blue
 // Returns rgb=0 + a=0 when the ray misses the plane or the SDF box.
 vec4 SDFSlice(vec2 uv, float depth) {
-    vec3 aabbMin = uSdf.AABBMinAndPlaneY.xyz;
-    vec3 aabbMax = uSdf.AABBMaxAndMaxDist.xyz;
-    float planeY = uSdf.AABBMinAndPlaneY.w;
-    float maxDist = max(uSdf.AABBMaxAndMaxDist.w, 1e-4);
+    // Phase 15f — when SliceSource==1, the sparse SSBO drives the sample +
+    // owns its own AABB (the sparse bake may have different padding than the
+    // dense one). When SliceSource==0 (legacy .rsdf), the dense 3D image is
+    // sampled and the dense AABB/MaxDist drive the box test.
+    int sliceSource = int(uSdf.PreviewParams.y);
+    SparseSDFParams sp;
+    sp.AABBMin = uSdf.SparseAABBMin;
+    sp.AABBMax = uSdf.SparseAABBMax;
+    sp.Dims    = uSdf.SparseDims;
+
+    vec3  aabbMin = (sliceSource == 1) ? uSdf.SparseAABBMin.xyz
+                                        : uSdf.AABBMinAndPlaneY.xyz;
+    vec3  aabbMax = (sliceSource == 1) ? uSdf.SparseAABBMax.xyz
+                                        : uSdf.AABBMaxAndMaxDist.xyz;
+    float planeY  = uSdf.AABBMinAndPlaneY.w;
+    float maxDist = max((sliceSource == 1) ? uSdf.SparseAABBMin.w
+                                            : uSdf.AABBMaxAndMaxDist.w, 1e-4);
 
     // Reconstruct camera ray from NDC (matches PbrLit's world-pos reconstruction
     // — depth==1.0 means far plane).
@@ -255,9 +270,17 @@ vec4 SDFSlice(vec2 uv, float depth) {
     // World → SDF UV (per-axis box mapping).
     vec3 boxSize = max(aabbMax - aabbMin, vec3(1e-6));
     vec3 uvw = (hitPos - aabbMin) / boxSize;
-    // R16_SNORM hardware gives [-1, 1]; decode to world units.
-    float snorm = texture(uMeshSDF, uvw).r;
-    float d     = snorm * maxDist;
+    float d;
+    if (sliceSource == 1) {
+        // Sparse path — sample directly in world space; sdf_sparse rejects
+        // out-of-AABB points with +1e6, which the box test above already
+        // filtered out. Returns world-unit distance directly.
+        d = SDFSparseSampleHelper(hitPos, sp);
+    } else {
+        // R16_SNORM hardware gives [-1, 1]; decode to world units.
+        float snorm = texture(uMeshSDF, uvw).r;
+        d = snorm * maxDist;
+    }
 
     // Saturate to the cell-distance scale so a bake at 64^3 still shows readable
     // gradient: divide by 0.5 × longest box axis as the visual unit, clamped.
@@ -289,16 +312,32 @@ vec4 SDFSlice(vec2 uv, float depth) {
         col = mix(col, vec3(0.95, 0.80, 0.20), iso);
     } else if (vizMode == 4) {
         // Gradient magnitude via voxel-spaced finite differences (central).
-        vec3 vox = 1.0 / vec3(textureSize(uMeshSDF, 0));
-        float dx = (texture(uMeshSDF, uvw + vec3(vox.x, 0.0, 0.0)).r -
-                    texture(uMeshSDF, uvw - vec3(vox.x, 0.0, 0.0)).r) * maxDist;
-        float dy = (texture(uMeshSDF, uvw + vec3(0.0, vox.y, 0.0)).r -
-                    texture(uMeshSDF, uvw - vec3(0.0, vox.y, 0.0)).r) * maxDist;
-        float dz = (texture(uMeshSDF, uvw + vec3(0.0, 0.0, vox.z)).r -
-                    texture(uMeshSDF, uvw - vec3(0.0, 0.0, vox.z)).r) * maxDist;
-        // Cell width along each axis: (2 * vox) * boxSize. Magnitude in
-        // world units / world units → ideally 1.0 for a clean SDF.
-        vec3 cell = 2.0 * vox * boxSize;
+        // Sparse path uses world-space steps of one voxel along each axis;
+        // dense path stays in texture-UV space to match the original behaviour.
+        float dx, dy, dz;
+        vec3 cell;
+        if (sliceSource == 1) {
+            uint res = max(uSdf.SparseDims.x, 1u);
+            vec3 vox = boxSize / vec3(res);
+            dx = SDFSparseSampleHelper(hitPos + vec3(vox.x, 0.0, 0.0), sp) -
+                 SDFSparseSampleHelper(hitPos - vec3(vox.x, 0.0, 0.0), sp);
+            dy = SDFSparseSampleHelper(hitPos + vec3(0.0, vox.y, 0.0), sp) -
+                 SDFSparseSampleHelper(hitPos - vec3(0.0, vox.y, 0.0), sp);
+            dz = SDFSparseSampleHelper(hitPos + vec3(0.0, 0.0, vox.z), sp) -
+                 SDFSparseSampleHelper(hitPos - vec3(0.0, 0.0, vox.z), sp);
+            cell = 2.0 * vox;
+        } else {
+            vec3 vox = 1.0 / vec3(textureSize(uMeshSDF, 0));
+            dx = (texture(uMeshSDF, uvw + vec3(vox.x, 0.0, 0.0)).r -
+                  texture(uMeshSDF, uvw - vec3(vox.x, 0.0, 0.0)).r) * maxDist;
+            dy = (texture(uMeshSDF, uvw + vec3(0.0, vox.y, 0.0)).r -
+                  texture(uMeshSDF, uvw - vec3(0.0, vox.y, 0.0)).r) * maxDist;
+            dz = (texture(uMeshSDF, uvw + vec3(0.0, 0.0, vox.z)).r -
+                  texture(uMeshSDF, uvw - vec3(0.0, 0.0, vox.z)).r) * maxDist;
+            // Cell width along each axis: (2 * vox) * boxSize. Magnitude in
+            // world units / world units → ideally 1.0 for a clean SDF.
+            cell = 2.0 * vox * boxSize;
+        }
         vec3 g = vec3(dx / max(cell.x, 1e-6),
                       dy / max(cell.y, 1e-6),
                       dz / max(cell.z, 1e-6));

@@ -36,4 +36,17 @@ BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
                           BakeProgress*        progress,
                           int                  algorithmChoice = 0);
 
+// Phase 15a: brick-native sparse bake. Produces BakedSparseSDF directly with
+// peak RAM ≈ occupiedBricks × brickSize^3, NOT res^3 — unblocks 1024^3 bakes
+// that the dense path can't fit. Output is bit-identical to
+// SDFCacheBuildSparse(MeshSDFBakerBake(...), brickSize) (same classify
+// threshold, same trailing-brick clamp). brickSize must be 4, 8, or 16.
+// Currently only algorithmChoice = 0 (Exact BVH) is wired; FSM is Phase 15b.
+BakedSparseSDF MeshSDFBakerBakeSparse(const VulkanContext& ctx,
+                                      const GpuMesh&       mesh,
+                                      uint32_t             resolution,
+                                      uint32_t             brickSize,
+                                      BakeProgress*        progress,
+                                      int                  algorithmChoice = 0);
+
 } // namespace RS

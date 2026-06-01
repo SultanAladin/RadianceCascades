@@ -1,0 +1,134 @@
+#version 450
+// Phase B — Multiple-scattering LUT (Hillaire 2020 §5.1.2).
+// For each (cos sun-zenith, altitude ratio) texel: estimate the average
+// multi-bounce contribution by isotropically sampling the sphere with a
+// single bounce of scattering, then closing the geometric series
+// (1 + f + f² + …) = 1/(1-f). Output RGB scaled by sun irradiance = 1.
+//
+// Size: 32×32, format R16G16B16A16F. Workgroup 8×8.
+
+#extension GL_GOOGLE_include_directive : require
+#include "include/atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uTransmittance;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uMultiScatter;
+
+layout(push_constant) uniform Push {
+    AtmosphereParams Atmo;
+    vec4             Sizes;     // x = MS size, y = TR width, z = TR height, w = steps
+    vec4             SunIrr;    // rgb = sun irradiance at TOA (unitless gain), w = sample sqrt-count
+} pc;
+
+vec3 SampleTransmittance(AtmoCoeffs c, float r, float mu) {
+    float tP = RaySphereIntersectNearest(vec3(0.0, 0.0, r), vec3(sqrt(max(1.0 - mu * mu, 0.0)), 0.0, mu), c.PlanetRadiusKm);
+    if (tP >= 0.0) {
+        return vec3(0.0);
+    }
+    vec2 uv = TransmittanceUVFromRMu(r, mu, c.PlanetRadiusKm, c.AtmoRadiusKm);
+    return textureLod(uTransmittance, uv, 0.0).rgb;
+}
+
+// Returns (L_2, f_ms) for one ray direction — Hillaire §5.1.2 split.
+//   L_2  : luminance at the sample point after one bounce of single scatter
+//   f_ms : energy that would feed the next bounce (used to close the series)
+void IntegrateSampleRay(AtmoCoeffs c, vec3 ro, vec3 rd, vec3 sunDir,
+                        int steps, out vec3 L_2, out vec3 f_ms) {
+    float tEnd    = RaySphereExit(ro, rd, c.AtmoRadiusKm);
+    float tPlanet = RaySphereIntersectNearest(ro, rd, c.PlanetRadiusKm);
+    if (tPlanet > 0.0) tEnd = min(tEnd, tPlanet);
+
+    float dt_km = tEnd / float(steps);
+    float dt_m  = dt_km * 1000.0;
+
+    vec3 transmittanceCam = vec3(1.0);
+    L_2  = vec3(0.0);
+    f_ms = vec3(0.0);
+
+    for (int i = 0; i < steps; ++i) {
+        float t   = (float(i) + 0.5) * dt_km;
+        vec3  pos = ro + rd * t;
+        float r   = length(pos);
+        float alt = max(r - c.PlanetRadiusKm, 0.0);
+
+        vec3  extinction = SampleExtinction(c, alt);
+        vec3  segTrans   = exp(-extinction * dt_m);
+
+        vec3  sRayleigh; float sMie;
+        SampleScattering(c, alt, sRayleigh, sMie);
+        vec3 scattering = sRayleigh + vec3(sMie);
+
+        // Sun transmittance to this point.
+        vec3 up      = pos / r;
+        float muSun  = clamp(dot(up, sunDir), -1.0, 1.0);
+        vec3 trSun   = SampleTransmittance(c, r, muSun);
+
+        // Multi-scattering integrand assumes isotropic phase = 1 / (4π).
+        vec3 phaseMs = vec3(1.0 / kFourPi);
+
+        // Integrate: in-scatter * phase * transmittance, analytically inside dt.
+        vec3 inScatter  = scattering * phaseMs * trSun;
+        vec3 segIntegral = (inScatter - inScatter * segTrans) / max(extinction, vec3(1e-6));
+        L_2  += transmittanceCam * segIntegral;
+
+        // f_ms term: same integral but ignoring sun (gives the energy that
+        // would arrive isotropically from a uniform 1 source).
+        vec3 msInScatter   = scattering * phaseMs;
+        vec3 msIntegral    = (msInScatter - msInScatter * segTrans) / max(extinction, vec3(1e-6));
+        f_ms += transmittanceCam * msIntegral;
+
+        transmittanceCam *= segTrans;
+    }
+}
+
+void main() {
+    uvec2 px  = gl_GlobalInvocationID.xy;
+    float sz  = pc.Sizes.x;
+    if (px.x >= uint(sz) || px.y >= uint(sz)) return;
+
+    AtmoCoeffs c = UnpackAtmoCoeffs(pc.Atmo);
+
+    vec2 uv = (vec2(px) + 0.5) / sz;
+    // Map texel → (cosSunZenith, altitudeRatio).
+    float cosSun     = uv.x * 2.0 - 1.0;
+    float altRatio   = uv.y;
+    float r          = mix(c.PlanetRadiusKm, c.AtmoRadiusKm, altRatio);
+
+    vec3 sunDir = vec3(sqrt(max(1.0 - cosSun * cosSun, 0.0)), 0.0, cosSun);
+    vec3 origin = vec3(0.0, 0.0, r);
+
+    // Spherical sample grid: sqrtCount × sqrtCount over (cosθ, φ).
+    int   sqrtN  = int(max(pc.SunIrr.w, 4.0));
+    int   total  = sqrtN * sqrtN;
+    float invN   = 1.0 / float(total);
+    int   steps  = int(max(pc.Sizes.w, 8.0));
+
+    vec3 L_2_sum  = vec3(0.0);
+    vec3 f_ms_sum = vec3(0.0);
+
+    for (int iy = 0; iy < sqrtN; ++iy) {
+        for (int ix = 0; ix < sqrtN; ++ix) {
+            float a = (float(ix) + 0.5) / float(sqrtN);
+            float b = (float(iy) + 0.5) / float(sqrtN);
+            float phi      = a * 2.0 * kPi;
+            float cosTheta = 1.0 - 2.0 * b;
+            float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+            vec3  rd       = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+            vec3 L_2, f_ms;
+            IntegrateSampleRay(c, origin, rd, sunDir, steps, L_2, f_ms);
+            L_2_sum  += L_2;
+            f_ms_sum += f_ms;
+        }
+    }
+    // Solid-angle factor for the iso sphere sample (4π / N).
+    vec3 L_2_avg  = L_2_sum  * (kFourPi * invN);
+    vec3 f_ms_avg = f_ms_sum * (kFourPi * invN);
+
+    // Close the geometric series: total multi-scatter = L_2 / (1 - f_ms).
+    vec3 psi = L_2_avg / max(vec3(1.0) - f_ms_avg, vec3(1e-3));
+    psi *= pc.SunIrr.rgb;
+
+    imageStore(uMultiScatter, ivec2(px), vec4(psi, 1.0));
+}

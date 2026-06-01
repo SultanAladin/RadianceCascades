@@ -178,4 +178,100 @@ bool SDF_TraceHit(sampler3D sdfTex,
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Sparse variants (Phase 15d/e). Same math as the dense helpers above, but
+// sample through the sparse-VDB SSBOs via the macros in sdf_sparse.glsl. We
+// can't pass SSBO arrays as function args (GLSL/SPIR-V wants static binding
+// references), so the helpers are macro-defined: the consumer pastes
+// SDFTRACE_DEFINE_SPARSE_HELPERS once after instantiating both the point
+// helper (SDFSPARSE_DEFINE_HELPER) AND the ray helper (SDFSPARSE_DEFINE_RAY_HELPER).
+//
+// The point helper backs central-difference normals + the soft-shadow penumbra
+// reads; the ray helper is the hot sphere-trace step (Phase 15c brick skip).
+//
+// Required setup in the consumer file (order matters):
+//   #include "include/sdf_sparse.glsl"
+//   layout(...) readonly buffer SparseIdx  { uint Data[]; } uSparseIdx;
+//   layout(...) readonly buffer SparsePool { uint Data[]; } uSparsePool;
+//   layout(...) uniform SparseParamsBuf    { SparseSDFParams P; } uSparseP;
+//   SDFSPARSE_DEFINE_HELPER    (uSparseIdx, uSparsePool)
+//   SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)
+//   #include "include/sdf_trace.glsl"
+//   SDFTRACE_DEFINE_SPARSE_HELPERS()
+//
+// After expansion, callers use:
+//   float vis = SDF_SoftShadowSparse(ro, rd, maxDist, k, maxSteps, minStep, P);
+//   bool  hit = SDF_TraceHitSparse  (ro, rd, tMin, tMax, maxSteps, minStep, P,
+//                                    outPos, outNormal, outDistTravelled);
+// -----------------------------------------------------------------------------
+
+#define SDFTRACE_DEFINE_SPARSE_HELPERS()                                          \
+float SDF_SoftShadowSparse(vec3 ro, vec3 rd,                                      \
+                           float maxDist, float k,                                \
+                           int maxSteps, float minStep,                           \
+                           SparseSDFParams params)                                \
+{                                                                                 \
+    /* Slab skip into the SDF box. If ro is inside (tEnter<0) start at 0. */      \
+    float tEnter = SDF_RayBoxEnter(ro, rd, params.AABBMin.xyz, params.AABBMax.xyz);\
+    if (tEnter < 0.0 && SDFSparseSampleHelper(ro, params) >= 1e5) {               \
+        return 1.0;                                                               \
+    }                                                                             \
+    float t = max(0.0, tEnter);                                                   \
+    if (t > maxDist) return 1.0;                                                  \
+    float res = 1.0;                                                              \
+    for (int i = 0; i < maxSteps; ++i) {                                          \
+        if (t > maxDist) break;                                                   \
+        float h = SDFSparseRaySampleHelper(ro + rd * t, rd, params);              \
+        if (h >= 1e5) {                                                           \
+            break;                                                                \
+        }                                                                         \
+        if (h < 0.001) return 0.0;                                                \
+        res = min(res, k * h / max(t, 1e-4));                                     \
+        t  += max(h, minStep);                                                    \
+    }                                                                             \
+    res = clamp(res, 0.0, 1.0);                                                   \
+    return res * res * (3.0 - 2.0 * res);                                         \
+}                                                                                 \
+                                                                                  \
+bool SDF_TraceHitSparse(vec3 ro, vec3 rd,                                         \
+                        float tMin, float tMax,                                   \
+                        int maxSteps, float minStep,                              \
+                        SparseSDFParams params,                                   \
+                        out vec3 outPos, out vec3 outNormal,                      \
+                        out float outDistTravelled)                               \
+{                                                                                 \
+    float tEnter = SDF_RayBoxEnter(ro, rd, params.AABBMin.xyz, params.AABBMax.xyz);\
+    float t      = max(tMin, max(0.0, tEnter));                                   \
+    for (int i = 0; i < maxSteps; ++i) {                                          \
+        if (t > tMax) break;                                                      \
+        vec3 p = ro + rd * t;                                                     \
+        float h = SDFSparseRaySampleHelper(p, rd, params);                        \
+        if (h >= 1e5) {                                                           \
+            break;                                                                \
+        }                                                                         \
+        if (h < 0.001) {                                                          \
+            outPos = p;                                                           \
+            outDistTravelled = t;                                                 \
+            /* Central diff normal. Use the point helper (trilinear); the ray */  \
+            /* helper would short-circuit AllOutside bricks and break the   */    \
+            /* gradient. Step = half a voxel along each axis.               */    \
+            vec3 boxSize = max(params.AABBMax.xyz - params.AABBMin.xyz, vec3(1e-6));\
+            vec3 eps = boxSize / (2.0 * vec3(float(params.Dims.x)));              \
+            float dx = SDFSparseSampleHelper(p + vec3(eps.x, 0, 0), params)       \
+                     - SDFSparseSampleHelper(p - vec3(eps.x, 0, 0), params);      \
+            float dy = SDFSparseSampleHelper(p + vec3(0, eps.y, 0), params)       \
+                     - SDFSparseSampleHelper(p - vec3(0, eps.y, 0), params);      \
+            float dz = SDFSparseSampleHelper(p + vec3(0, 0, eps.z), params)       \
+                     - SDFSparseSampleHelper(p - vec3(0, 0, eps.z), params);      \
+            outNormal = normalize(vec3(dx, dy, dz));                              \
+            return true;                                                          \
+        }                                                                         \
+        t += max(h, minStep);                                                     \
+    }                                                                             \
+    outPos = ro + rd * min(t, tMax);                                              \
+    outDistTravelled = min(t, tMax);                                              \
+    outNormal = -rd;                                                              \
+    return false;                                                                 \
+}
+
 #endif // SDF_TRACE_GLSL_INCLUDED

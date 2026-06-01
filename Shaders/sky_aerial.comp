@@ -1,0 +1,106 @@
+#version 450
+// Phase B — Aerial-Perspective LUT (Hillaire 2020 §5.2).
+// 32×32×32 RGBA16F 3D image. Per voxel = (per-view-frustum tile, depth slice).
+// Output rgb = accumulated inscatter to that depth, a = transmittance from
+// camera to that depth.
+//
+// Toggle-gated (BakeAerialPerspective). No consumer yet — fog-on-geometry
+// hooks land in a later phase.
+//
+// Workgroup 8×8×1 over (x, y), iterating the depth dimension per invocation.
+
+#extension GL_GOOGLE_include_directive : require
+#include "include/atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uTransmittance;
+layout(set = 0, binding = 1) uniform sampler2D uMultiScatter;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image3D uAerialPerspective;
+
+layout(push_constant) uniform Push {
+    AtmosphereParams Atmo;
+    vec4             SunDirAndIntensity; // xyz = sun dir, w = sun gain
+    vec4             ViewParams;         // x = res, y = stepsPerSlice, z = depthSliceMeters, w = cameraAltitudeKm
+    vec4             FrustumX;           // local-frame X axis basis for the camera frustum
+    vec4             FrustumY;           // local-frame Y axis basis
+    vec4             FrustumForward;     // forward axis (z-out of camera in local frame)
+} pc;
+
+vec3 SampleTransmittance(AtmoCoeffs c, float r, float mu) {
+    float tP = RaySphereIntersectNearest(vec3(0.0, 0.0, r), vec3(sqrt(max(1.0 - mu * mu, 0.0)), 0.0, mu), c.PlanetRadiusKm);
+    if (tP >= 0.0) {
+        return vec3(0.0);
+    }
+    vec2 uv = TransmittanceUVFromRMu(r, mu, c.PlanetRadiusKm, c.AtmoRadiusKm);
+    return textureLod(uTransmittance, uv, 0.0).rgb;
+}
+vec3 SampleMultiScatter(AtmoCoeffs c, float r, float muSun) {
+    float altRatio = clamp((r - c.PlanetRadiusKm) / max(c.AtmoRadiusKm - c.PlanetRadiusKm, 1e-3), 0.0, 1.0);
+    return textureLod(uMultiScatter, vec2(muSun * 0.5 + 0.5, altRatio), 0.0).rgb;
+}
+
+void main() {
+    uvec3 vox = gl_GlobalInvocationID;
+    float res = pc.ViewParams.x;
+    if (vox.x >= uint(res) || vox.y >= uint(res) || vox.z >= uint(res)) return;
+
+    AtmoCoeffs c = UnpackAtmoCoeffs(pc.Atmo);
+    vec3 sunDir  = normalize(pc.SunDirAndIntensity.xyz);
+
+    // Tile (x, y) → NDC-style basis combination → world ray dir in local frame.
+    vec2 ndc = ((vec2(vox.xy) + 0.5) / res) * 2.0 - 1.0;
+    vec3 rd  = normalize(pc.FrustumForward.xyz
+                        + pc.FrustumX.xyz * ndc.x
+                        + pc.FrustumY.xyz * ndc.y);
+
+    float camAltKm = max(pc.ViewParams.w, 0.001);
+    float r0       = c.PlanetRadiusKm + camAltKm;
+    vec3  ro       = vec3(0.0, 0.0, r0);
+
+    // March from camera to (vox.z + 1) * sliceDepth metres.
+    float sliceKm = pc.ViewParams.z * 0.001;
+    float zEndKm  = (float(vox.z) + 1.0) * sliceKm;
+
+    int   steps = int(max(pc.ViewParams.y, 4.0));
+    float dt_km = zEndKm / float(steps);
+    float dt_m  = dt_km * 1000.0;
+
+    vec3 transmittance = vec3(1.0);
+    vec3 L             = vec3(0.0);
+
+    float cosTheta = clamp(dot(rd, sunDir), -1.0, 1.0);
+    float phaseR   = RayleighPhase(cosTheta);
+    float phaseM   = MiePhase(cosTheta, c.MieG);
+
+    for (int i = 0; i < steps; ++i) {
+        float t   = (float(i) + 0.5) * dt_km;
+        vec3  pos = ro + rd * t;
+        float rr  = length(pos);
+        float alt = max(rr - c.PlanetRadiusKm, 0.0);
+
+        vec3 extinction = SampleExtinction(c, alt);
+        vec3 segTrans   = exp(-extinction * dt_m);
+
+        vec3  sRayleigh; float sMie;
+        SampleScattering(c, alt, sRayleigh, sMie);
+
+        vec3  upP   = pos / rr;
+        float muSun = clamp(dot(upP, sunDir), -1.0, 1.0);
+        vec3  trSun = SampleTransmittance(c, rr, muSun);
+
+        vec3 singleScatter = (sRayleigh * phaseR + vec3(sMie) * phaseM) * trSun;
+        vec3 multiScatter  = (sRayleigh + vec3(sMie)) * SampleMultiScatter(c, rr, muSun);
+        vec3 totalIn       = singleScatter + multiScatter;
+        vec3 segIntegral   = (totalIn - totalIn * segTrans) / max(extinction, vec3(1e-6));
+        L += transmittance * segIntegral;
+        transmittance *= segTrans;
+    }
+
+    L *= pc.SunDirAndIntensity.w;
+
+    // Pack scalar transmittance into alpha (Hillaire stores luminance-weighted
+    // grey; we average since the renderer doesn't need spectral fog yet).
+    float aTrans = dot(transmittance, vec3(0.2126, 0.7152, 0.0722));
+    imageStore(uAerialPerspective, ivec3(vox), vec4(L, aTrans));
+}

@@ -484,4 +484,16 @@ ResidentSparseSDF GlobalSDFUploadSparse(GlobalSDF& g, const VulkanContext& ctx,
     return r;
 }
 
+bool GlobalSDFTryLoadSparseFromCache(GlobalSDF& g, const VulkanContext& ctx,
+                                     MeshHandle mesh, const char* sourcePath,
+                                     uint32_t resolution, uint32_t brickSize) {
+    if (!g.Initialized || mesh == 0 || sourcePath == nullptr) return false;
+    const std::string path = SDFCacheDeriveSparsePath(sourcePath, resolution, brickSize);
+    BakedSparseSDF baked;
+    if (!SDFCacheLoadSparse(path.c_str(), baked)) return false;
+    const ResidentSparseSDF r = GlobalSDFUploadSparse(g, ctx, mesh, baked,
+                                                      /*fromCache*/ true);
+    return r.IndexBuffer != VK_NULL_HANDLE;
+}
+
 } // namespace RS

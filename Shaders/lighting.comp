@@ -1,31 +1,25 @@
 #version 450
-// Phase 10 lighting compose. 8x8 compute kernel reads the GBuffer, computes
-// Karis/Schlick/Smith direct lighting + Karis split-sum IBL + samples the
-// active shadow algorithm's set=2 contract, and writes RGBA16F into the
-// LightHDR offscreen.
+// Phase 10 lighting compose — PCF variant. 8x8 compute kernel reads the GBuffer,
+// computes either classic Karis Cook-Torrance or (when realistic-PBR is on)
+// Bosch 2024 EON diffuse + Fdez-Aguera 2019 energy-compensated GGX + KHR
+// specular semantics, then composes Karis split-sum IBL + the active shadow
+// algorithm's set=2 contract, and writes RGBA16F into LightHDR.
 //
-// Descriptor contract:
-//   set=0 : (push constants only — no descriptors)
-//   set=1 : binding 0..5 = GBuffer SRVs in the same order as
-//           gbuffer_preview.frag (albedo, normal, RMF, emissive, depth, identity)
-//           binding 6 = irradiance cube
-//           binding 7 = prefilter cube
-//           binding 8 = BRDF LUT
-//           binding 9 = LightHDR storage image (rgba16f) — write target
-//   set=2 : Shadow algo. PCF variant:
-//           binding 0 = sampler2DArrayShadow over the 4-cascade D32_SFLOAT atlas
-//           binding 1 = AlgoUbo (CascadeViewProj[4] + CascadeSplits + PCFParams + Atlas)
-//   set=3 : reserved for GI (Phase 11+) — empty descriptor layout for now
-//
-// Phase 11 splits the compose shader per shadow variant:
-//   variant 0 (PCF)  — this file
-//   variant 1 (PCSS) — lighting_pcss.comp
-//   variant 2 (VSM)  — lighting_vsm.comp
-// Lighting.cpp picks the right SPV from the active IShadowAlgorithm::AlgoVariant().
+// Descriptor contract (unchanged set numbering; binding 10 added to set=1):
+//   set=0 : (push constants only)
+//   set=1 : 0..5 = GBuffer SRVs (albedo, normal, RMF, emissive, depth, identity)
+//           6..8 = irradiance / prefilter / BRDF LUT
+//           9    = LightHDR storage image (rgba16f)
+//           10   = Specular SRV (KHR specularColor)         <-- new
+//   set=2 : Shadow algo (PCF: sampler2DArrayShadow + AlgoUbo)
+//   set=3 : reserved for GI
+
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// ----------------------- set=1 GBuffer + IBL + output ------------------------
+#include "include/pbr_brdf.glsl"
+
 layout(set = 1, binding = 0) uniform sampler2D    uAlbedo;
 layout(set = 1, binding = 1) uniform sampler2D    uNormal;
 layout(set = 1, binding = 2) uniform sampler2D    uRMF;
@@ -36,139 +30,83 @@ layout(set = 1, binding = 6) uniform samplerCube  uIrradiance;
 layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
 layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
 layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
+layout(set = 1, binding = 10) uniform sampler2D   uSpecular;
 
-// ----------------------- set=2 shadow algo contract --------------------------
-// PCF: sampler2DArrayShadow (combined sampler+image array)
 layout(set = 2, binding = 0) uniform sampler2DArrayShadow uShadowAtlas;
 layout(set = 2, binding = 1) uniform AlgoUbo {
-    mat4 CascadeViewProj[4];   // light-space view-proj per cascade
-    vec4 CascadeSplits;        // view-space far plane per cascade
-    vec4 PCFParams;            // x = kernel radius, y = depth bias, z = normal bias, w = jitter
-    vec4 AtlasParams;          // x = 1/cascadeSize, y = cascadeSize, z = cascadeCount, w = unused
+    mat4 CascadeViewProj[4];
+    vec4 CascadeSplits;
+    vec4 PCFParams;
+    vec4 AtlasParams;
 } ualgo;
 
-// ----------------------- set=3 GI stub ---------------------------------------
-// Phase 10 binds an empty set layout here to keep the contract stable.
-
-// ----------------------- push constants --------------------------------------
 layout(push_constant) uniform Push {
-    mat4 InvViewProj;          // for world-pos reconstruction from depth
-    vec4 EyePosWorld;          // xyz = eye, w = ambient (fallback when IBL off)
-    vec4 SunDirAndIntensity;   // xyz = direction toward sun, w = intensity
-    vec4 SunColor;             // rgb, w unused
-    vec4 IblParams;            // x = on/off, y = intensity, z = prefilter mip count, w = unused
-    vec4 ResAndFlags;          // x = render width, y = render height, z = unused, w = unused
+    mat4 InvViewProj;
+    vec4 EyePosWorld;          // xyz = eye, w = ambient fallback
+    vec4 SunDirAndIntensity;
+    vec4 SunColor;
+    vec4 IblParams;            // x = ibl on, y = ibl intensity,
+                               // z = prefilter mip count, w = float-bits of PbrFlags
+    vec4 ResAndFlags;
 } pc;
 
-// ----------------------- helpers ---------------------------------------------
-
-const float kPI = 3.14159265359;
-
-float D_GGX(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / (kPI * d * d + 1e-5);
-}
-
-float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
-    float a    = roughness * roughness;
-    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
-    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
-    return 0.5 / max(ggxV + ggxL, 1e-5);
-}
-
-vec3 F_Schlick(float VdotH, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-}
-
-vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
-    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-// View-space depth for cascade selection. We re-project worldPos.
-float ViewDepth(vec3 worldPos, mat4 view) {
-    vec4 vp = view * vec4(worldPos, 1.0);
-    return -vp.z;   // OpenGL-style RH negative-z forward
-}
-
-// PCF sample: project worldPos into the chosen cascade's clip space, do the
-// hardware shadow compare with a small box filter. AlgoUbo PCFParams.x is the
-// kernel radius in shadowmap texels.
 float SamplePcfShadow(vec3 worldPos, vec3 worldN, float linearViewDepth) {
-    if (ualgo.PCFParams.w <= 0.0001) return 1.0;    // disabled
+    if (ualgo.PCFParams.w <= 0.0001) return 1.0;
 
-    // Pick cascade by view-space depth — first cascade whose split contains it.
     int cascade = 3;
     for (int c = 0; c < 4; ++c) {
         if (linearViewDepth < ualgo.CascadeSplits[c]) { cascade = c; break; }
     }
-
-    // Apply normal bias along worldN to push the receiver position slightly
-    // out of the surface; combined with the front-face cull in the depth pass
-    // this kills most self-shadow acne.
     vec3 biasedPos = worldPos + worldN * ualgo.PCFParams.z;
-
     vec4 lsPos = ualgo.CascadeViewProj[cascade] * vec4(biasedPos, 1.0);
     if (lsPos.w <= 0.0) return 1.0;
     vec3 ndc = lsPos.xyz / lsPos.w;
-    // Vulkan: depth is [0,1], xy NDC is [-1,1] → uv [0,1]. Y was already flipped
-    // in the light projection (matches gbuffer_preview's convention).
     vec2 uv = ndc.xy * 0.5 + 0.5;
-    float receiverZ = ndc.z - ualgo.PCFParams.y;    // subtract depth bias
-
-    // Reject outside cascade (sampler2DArrayShadow returns 1.0 at the border
-    // via OPAQUE_WHITE clamp-to-border, but the .z range still needs to be
-    // [0,1] for the compare to make sense).
+    float receiverZ = ndc.z - ualgo.PCFParams.y;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
     if (receiverZ < 0.0 || receiverZ > 1.0) return 1.0;
 
-    // Kernel: PCFParams.x is the integer radius. 0 = single tap, 1 = 3x3, ...
-    int  radius = int(clamp(ualgo.PCFParams.x, 0.0, 3.0));
-    float texel = ualgo.AtlasParams.x;
+    int   radius = int(clamp(ualgo.PCFParams.x, 0.0, 3.0));
+    float texel  = ualgo.AtlasParams.x;
 
     float sum = 0.0;
     float count = 0.0;
     for (int y = -radius; y <= radius; ++y) {
         for (int x = -radius; x <= radius; ++x) {
             vec2 ofs = vec2(x, y) * texel;
-            sum += texture(uShadowAtlas,
-                           vec4(uv + ofs, float(cascade), receiverZ));
+            sum += texture(uShadowAtlas, vec4(uv + ofs, float(cascade), receiverZ));
             count += 1.0;
         }
     }
     return sum / max(count, 1.0);
 }
 
-// ----------------------- main ------------------------------------------------
-
 void main() {
-    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 px  = ivec2(gl_GlobalInvocationID.xy);
     ivec2 res = ivec2(pc.ResAndFlags.xy);
     if (px.x >= res.x || px.y >= res.y) return;
 
     vec2 uv = (vec2(px) + 0.5) / vec2(res);
 
     float depth = texture(uDepth, uv).r;
-    // Background: write 0 — the Lit preview discards where depth == 1.0 anyway,
-    // but cleaning the storage image keeps later passes deterministic.
     if (depth >= 1.0) {
         imageStore(uLightHDR, px, vec4(0.0));
         return;
     }
 
-    vec3  albedo  = texture(uAlbedo,   uv).rgb;
-    vec3  encN    = texture(uNormal,   uv).rgb;
-    vec3  rmf     = texture(uRMF,      uv).rgb;
-    vec3  emiss   = texture(uEmissive, uv).rgb;
+    vec4 albedoAO = texture(uAlbedo,   uv);
+    vec3 albedo   = albedoAO.rgb;
+    float ao      = albedoAO.a;
+    vec3 encN     = texture(uNormal,   uv).rgb;
+    vec3 rmf      = texture(uRMF,      uv).rgb;
+    vec3 emiss    = texture(uEmissive, uv).rgb;
+    vec3 specCol  = texture(uSpecular, uv).rgb;
 
     vec3  N         = normalize(encN * 2.0 - 1.0);
     float roughness = max(rmf.r, 0.04);
     float metallic  = rmf.g;
-    float F0Scalar  = rmf.b;
+    float specFact  = rmf.b;
 
-    // World-pos reconstruction (matches gbuffer_preview.frag).
     vec4 ndc       = vec4(uv * 2.0 - 1.0, depth, 1.0);
     vec4 worldH    = pc.InvViewProj * ndc;
     vec3 worldPos  = worldH.xyz / worldH.w;
@@ -180,27 +118,38 @@ void main() {
     float NdotV = max(dot(N, V), 1e-3);
     float NdotH = max(dot(N, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
+    float LdotV = dot(L, V);
 
-    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    vec3 F0 = ComputeF0_KHR(albedo, metallic, specCol, specFact);
 
-    float D  = D_GGX(NdotH, roughness);
+    uint flags     = UnpackPbrFlags(pc.IblParams.w);
+    bool realistic = IsRealisticPbr(flags);
+
+    // Specular lobe.
+    float D = D_GGX(NdotH, roughness);
     float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
     vec3  F  = F_Schlick(VdotH, F0);
+    vec3  specular = D * Vt * F;
 
-    vec3 specular = D * Vt * F;
-    vec3 kS       = F;
-    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
-    vec3 diffuse  = kD * albedo / kPI;
+    // Diffuse lobe.
+    vec3 kS = F;
+    vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
+    vec3 diffuse = realistic
+        ? kD * Diffuse_EON(albedo, NdotV, NdotL, LdotV, roughness)
+        : kD * albedo * kInvPI;
 
-    // Shadow factor: re-derive view-space depth for cascade selection.
-    // Approximate: distance along V from eye to worldPos.
+    // Multi-scatter energy compensation (Fdez-Aguera 2019) — only on realistic
+    // path. Uses the BRDF LUT we already sample for IBL.
+    vec2 brdfLut = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
+    vec3 ecomp   = realistic ? EnergyCompFactor(F0, brdfLut) : vec3(1.0);
+
     float viewDepth = length(pc.EyePosWorld.xyz - worldPos);
     float shadow    = SamplePcfShadow(worldPos, N, viewDepth);
 
     vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;
-    vec3 lit = (diffuse + specular) * sunRadiance * NdotL * shadow;
+    vec3 lit = (diffuse + specular * ecomp) * sunRadiance * NdotL * shadow;
 
-    // IBL split-sum (Karis) — same path as gbuffer_preview's PbrLit().
+    // IBL split-sum.
     vec3 ambient;
     if (pc.IblParams.x >= 0.5) {
         vec3  R         = reflect(-V, N);
@@ -210,14 +159,19 @@ void main() {
 
         float mipCount  = max(pc.IblParams.z - 1.0, 0.0);
         vec3  prefilt   = textureLod(uPrefilter, R, roughness * mipCount).rgb;
-        vec2  brdf      = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
-        vec3  specIBL   = prefilt * (Fr * brdf.x + brdf.y);
+        vec3  specIBL   = prefilt * (Fr * brdfLut.x + brdfLut.y) * ecomp;
 
-        ambient = (kD_ibl * irr * albedo + specIBL) * pc.IblParams.y;
+        vec3  diffIBL = realistic
+            ? kD_ibl * irr * Diffuse_EON(albedo, NdotV, 1.0, 1.0, roughness) * kPI  // EON at NdotL=1 ≈ rho/π * (A+B)
+            : kD_ibl * irr * albedo;
+
+        ambient = (diffIBL + specIBL) * pc.IblParams.y;
     } else {
         ambient = albedo * pc.EyePosWorld.w;
     }
 
-    vec3 result = lit + ambient + emiss;
-    imageStore(uLightHDR, px, vec4(result, 1.0));
+    // AO modulates ambient (and only ambient — direct light is shadowed).
+    ambient *= ao;
+
+    imageStore(uLightHDR, px, vec4(lit + ambient + emiss, 1.0));
 }

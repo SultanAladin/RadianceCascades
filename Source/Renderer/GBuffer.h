@@ -26,16 +26,16 @@ namespace RS {
 // on as a fallback used when an instance's binding resolves to an invalid
 // handle (and when Phase 6's Sun panel hot-reloads a tweaked default).
 struct GBufferMaterial {
-    glm::vec3 BaseColor = glm::vec3(0.78f, 0.78f, 0.80f);
-    float     Roughness = 0.55f;
-    float     Metallic  = 0.0f;
-    float     F0        = 0.04f;     // dielectric reference
-    glm::vec3 Emissive  = glm::vec3(0.0f);
+    glm::vec3 BaseColor     = glm::vec3(0.78f, 0.78f, 0.80f);
+    float     AO            = 1.0f;
+    float     Roughness     = 0.55f;
+    float     Metallic      = 0.0f;
+    float     SpecFactor    = 1.0f;            // KHR specularFactor (dielectrics)
+    glm::vec3 SpecColor     = glm::vec3(1.0f); // KHR specularColor (dielectrics; ignored on metals)
+    glm::vec3 Emissive      = glm::vec3(0.0f);
 };
 
-// Flatten a PbrMaterial into the smaller GPU push-constant shape. F0 is the
-// red channel of F0Flat for v1 — multi-channel F0 is a Phase 11+ topic that
-// also brings textured Fresnel.
+// Flatten a PbrMaterial into the GPU push-constant shape.
 GBufferMaterial GBufferMaterialFromPbr(const PbrMaterial& m);
 
 // Phase 11.5 floor checker config — drives the procedural two-tile pattern in

@@ -1,25 +1,40 @@
 #version 450
 // Phase 14b — Radiance Cascade hash relight pass.
+// Phase 15e — sparse SDF: the sampler3D bind point is replaced by a sparse-VDB
+// pair (BrickIndex SSBO + BrickPool SSBO) plus a SparseParams UBO. The hot
+// sphere-trace loop uses the brick-aware ray helper, so cascade rays cross
+// empty space in one step instead of grinding voxel-by-voxel.
 //
 // One workgroup per occupied cell (sourced from CellList[1..count]). Trace
-// R0=32 rays into the SDF, sample direct lighting at the hit (sun · NdotL ·
-// SDF cone-shadow), or look up the next-cascade SH probe at the miss endpoint
+// rays into the SDF, sample direct lighting at the hit (sun · NdotL · SDF
+// cone-shadow), or look up the next-cascade SH probe at the miss endpoint
 // (radiance-interval extension, Taichi C4-validated). Accumulate into SH-L1
 // luma (4 bands × 1 channel = 1 vec4) and write to ProbePayload.
 //
 // Descriptor sets:
-//   set=0 : SDF (binding 0 = sampler3D R16_SNORM)
+//   set=0 : Sparse SDF
+//           binding 0 = SparseIdx  SSBO  (uint BrickIndex[BrickGrid^3])
+//           binding 1 = SparsePool SSBO  (uint BrickPool[occupied*bs^3/2])
+//           binding 2 = SparseParams UBO (SparseSDFParams)
 //   set=1 : RcHash (same 4 bindings as rc_insert)
 
 #extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+#include "include/sdf_sparse.glsl"
+
+layout(std430, set = 0, binding = 0) readonly buffer SparseIdx  { uint Data[]; } uSparseIdx;
+layout(std430, set = 0, binding = 1) readonly buffer SparsePool { uint Data[]; } uSparsePool;
+layout(std140, set = 0, binding = 2) uniform SparseParamsBuf { SparseSDFParams P; } uSparseP;
+
+SDFSPARSE_DEFINE_HELPER    (uSparseIdx, uSparsePool)
+SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)
+
 #include "include/rc_hash.glsl"
 #include "include/sdf_trace.glsl"
 
-// ----------------------- set=0: SDF -------------------------------------------
-layout(set = 0, binding = 0) uniform sampler3D uSdf;
+SDFTRACE_DEFINE_SPARSE_HELPERS()
 
 // ----------------------- set=1: RC hash ---------------------------------------
 layout(std430, set = 1, binding = 0) buffer RC_KeyBuf     { uint  gRC_Keys[];     };
@@ -37,9 +52,6 @@ layout(push_constant) uniform Push {
 
 // ----------------------- helpers ---------------------------------------------
 
-// Compact uniform hemisphere sample using Hammersley + cosine warp.
-// Caller picks `i / N` for index; the second seed is per-cell jitter so two
-// cells don't sweep the same directions every frame.
 vec2 RC_Hammersley(uint i, uint N) {
     uint bits = i;
     bits = (bits << 16u) | (bits >> 16u);
@@ -50,7 +62,6 @@ vec2 RC_Hammersley(uint i, uint N) {
     return vec2(float(i) / float(N), float(bits) * 2.3283064365386963e-10);
 }
 
-// Sphere sampling — RC probes are unoriented, so we sample the full sphere.
 vec3 RC_SphereDir(vec2 xi) {
     float phi   = 6.2831853 * xi.x;
     float cosT  = 1.0 - 2.0 * xi.y;
@@ -58,9 +69,6 @@ vec3 RC_SphereDir(vec2 xi) {
     return vec3(cos(phi) * sinT, cosT, sin(phi) * sinT);
 }
 
-// Look up SH-L1 at world pos in the *next* cascade up. Used for the
-// radiance-interval extension when a ray escapes its budget without hitting.
-// Returns 0 if no slot found within probe cap.
 vec4 RC_FetchNextCascadeSh(vec3 worldPos, uint cascade) {
     int  cascadeCount = int(gRC_P.CascadeParams.y);
     uint nextC = min(cascade + 1u, uint(cascadeCount - 1));
@@ -89,18 +97,15 @@ void main() {
     uint count   = gRC_CellList[0];
     if (cellIdx >= count) return;
 
-    // CellList[1..count] holds the keys of occupied slots.
     uint key = gRC_CellList[cellIdx + 1u];
     if (key == 0u) return;
 
-    // Find the slot this key lives in (relight may run on a different frame
-    // ordering than insert, but same hash → same probe sequence).
     const uint N = gRC_Keys.length();
     const uint mask = N - 1u;
     uint slot = RC_HashWord(key) & mask;
     for (uint probe = 0u; probe < 8u; ++probe) {
         if (gRC_Keys[slot] == key) break;
-        if (gRC_Keys[slot] == 0u)  return;     // key was inserted but slot was overwritten? bail
+        if (gRC_Keys[slot] == 0u)  return;
         slot = (slot + 1u) & mask;
     }
 
@@ -114,12 +119,9 @@ void main() {
     int rayCount = int(gRC_P.CascadeParams.z);
     rayCount = clamp(rayCount, 4, 64);
 
-    // Cascade c traces out to ~ cellPitch(c) × multiplier. Higher cascades
-    // trace longer rays so they catch farther-field bounces.
     float cellPitch = RC_CellPitch(s0, cascade);
     float maxDist   = max(pc.MaxDistance, cellPitch * 4.0);
 
-    // Per-cell jitter so neighbouring cells don't sweep identical directions.
     uint jitter = uint(gRC_P.SecondaryParams.z) ^ key;
     float jitterX = float(RC_HashWord(jitter)) * 2.3283064365386963e-10;
     float jitterY = float(RC_HashWord(jitter ^ 0x9E3779B9u)) * 2.3283064365386963e-10;
@@ -130,12 +132,6 @@ void main() {
     float sunLuma      = dot(sunColor * sunIntensity, vec3(0.2126, 0.7152, 0.0722));
     float ambientLuma  = gRC_P.SunColor.w;
 
-    vec3  aabbMin   = gRC_P.SdfAabbMin.xyz;
-    vec3  aabbMax   = gRC_P.SdfAabbMax.xyz;
-    float decode    = gRC_P.SdfAabbMax.w;
-
-    // Surface offset — start the ray slightly off the probe center to avoid
-    // self-intersection if the probe lands inside geometry.
     float tMin = max(cellPitch * 0.05, 0.005);
 
     vec4 shAccum = vec4(0.0);
@@ -147,38 +143,27 @@ void main() {
         xi.y = fract(xi.y + jitterY);
         vec3 dir = RC_SphereDir(xi);
 
-        // Trace into SDF. Note: the SDF is mesh-local for the resident mesh.
-        // For Phase 14b we trace in mesh-local space directly — the C++ side
-        // writes mesh-local AABB into the params so probe positions are
-        // converted on the fly via probe⋅invModel before this dispatch.
-        // (Simplest pre-multi-mesh: pretend world == mesh-local; revisit when
-        // multi-mesh SDF lands.)
+        // Trace into sparse SDF. The SparseSDFParams AABB lives in the SDF's
+        // local frame; for Phase 14b/15e we pretend probe world == mesh-local
+        // (multi-mesh + per-instance invModel transform lands in Phase 16).
         vec3 outPos, outNormal;
         float outDist;
-        bool hit = SDF_TraceHit(uSdf, probePos, dir, tMin, maxDist,
-                                int(pc.MaxSteps), pc.MinStep,
-                                aabbMin, aabbMax, decode,
-                                outPos, outNormal, outDist);
+        bool hit = SDF_TraceHitSparse(probePos, dir, tMin, maxDist,
+                                      int(pc.MaxSteps), pc.MinStep,
+                                      uSparseP.P,
+                                      outPos, outNormal, outDist);
 
         float radianceLuma = 0.0;
         if (hit) {
-            // Direct lighting: sun · max(N·L, 0) · sky-tinted ambient fill.
             float NdotL = max(dot(outNormal, sunDir), 0.0);
-            // Visibility = secondary cone trace toward sun from the hit point.
-            // Reuse SDF_SoftShadow with a single hard cone (k = large).
-            float vis = SDF_SoftShadow(uSdf, outPos, sunDir,
-                                       maxDist, 32.0,
-                                       int(pc.MaxSteps), pc.MinStep,
-                                       aabbMin, aabbMax, decode);
+            float vis = SDF_SoftShadowSparse(outPos, sunDir,
+                                             maxDist, 32.0,
+                                             int(pc.MaxSteps), pc.MinStep,
+                                             uSparseP.P);
             radianceLuma = sunLuma * NdotL * vis + ambientLuma;
         } else {
-            // Escape: chain into next cascade's SH probe at endpoint
-            // (radiance-interval extension, Taichi C4-validated).
             vec4 nextSh = RC_FetchNextCascadeSh(outPos, cascade);
-            // Eval as ambient (N = +Y is fine — SH probe is approximately
-            // omni at this scale; we just want the band-0 magnitude).
             radianceLuma = max(nextSh.x * 3.14159265 * kSH_Y00, 0.0);
-            // Sky contribution above the horizon — light dome fill.
             radianceLuma += max(dir.y, 0.0) * ambientLuma * 0.5;
         }
 
@@ -187,11 +172,10 @@ void main() {
     }
 
     if (weightSum > 0.0) {
-        shAccum *= (4.0 * 3.14159265) / weightSum;   // monte-carlo norm (sphere)
+        shAccum *= (4.0 * 3.14159265) / weightSum;
     }
 
-    // EMA with previous-frame payload so the result is temporally stable.
     vec4 prev = gRC_Payload[slot];
-    float alpha = 0.25;                              // 4-frame EMA
+    float alpha = 0.25;
     gRC_Payload[slot] = mix(prev, shAccum, alpha);
 }

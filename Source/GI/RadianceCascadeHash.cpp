@@ -154,11 +154,32 @@ bool RadianceCascadeHashInitialize(RadianceCascadeHash& h,
     }
     if (!CreateBuffer(ctx, cellListBytes,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                       h.CellListBuffer, h.CellListMemory)) {
         RS_LOG_ERROR("RadianceCascadeHash: CellListBuffer alloc failed");
         return false;
+    }
+
+    // Phase 14c: 4-byte host-visible readback ring for CellList[0].
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        if (!CreateBuffer(ctx, sizeof(uint32_t),
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          h.ReadbackBuffers[i], h.ReadbackMemory[i])) {
+            RS_LOG_ERROR("RadianceCascadeHash: ReadbackBuffer alloc failed slot %u", i);
+            return false;
+        }
+        void* mapped = nullptr;
+        if (vkMapMemory(ctx.Device, h.ReadbackMemory[i], 0, sizeof(uint32_t), 0,
+                        &mapped) != VK_SUCCESS) {
+            RS_LOG_ERROR("RadianceCascadeHash: ReadbackBuffer map failed slot %u", i);
+            return false;
+        }
+        h.ReadbackMapped[i] = reinterpret_cast<uint32_t*>(mapped);
+        h.ReadbackMapped[i][0] = 0u;
     }
 
     for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
@@ -223,6 +244,15 @@ void RadianceCascadeHashTerminate(RadianceCascadeHash& h, const VulkanContext& c
         if (h.ParamsMemory[i])  vkFreeMemory   (ctx.Device, h.ParamsMemory[i],  nullptr);
         h.ParamsBuffers[i] = VK_NULL_HANDLE;
         h.ParamsMemory[i]  = VK_NULL_HANDLE;
+
+        if (h.ReadbackMapped[i]) {
+            vkUnmapMemory(ctx.Device, h.ReadbackMemory[i]);
+            h.ReadbackMapped[i] = nullptr;
+        }
+        if (h.ReadbackBuffers[i]) vkDestroyBuffer(ctx.Device, h.ReadbackBuffers[i], nullptr);
+        if (h.ReadbackMemory[i])  vkFreeMemory   (ctx.Device, h.ReadbackMemory[i],  nullptr);
+        h.ReadbackBuffers[i] = VK_NULL_HANDLE;
+        h.ReadbackMemory[i]  = VK_NULL_HANDLE;
     }
     if (h.DescriptorPool)  vkDestroyDescriptorPool     (ctx.Device, h.DescriptorPool,  nullptr);
     if (h.SetLayout)       vkDestroyDescriptorSetLayout(ctx.Device, h.SetLayout,       nullptr);
@@ -275,6 +305,45 @@ void RadianceCascadeHashClearForFrame(const RadianceCascadeHash& h,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 2, b, 0, nullptr);
+}
+
+void RadianceCascadeHashRecordReadback(const RadianceCascadeHash& h,
+                                       VkCommandBuffer cmd,
+                                       uint32_t frameSlot) {
+    if (!h.Initialized) return;
+    if (frameSlot >= VulkanContext::kFramesInFlight) return;
+    if (h.ReadbackBuffers[frameSlot] == VK_NULL_HANDLE) return;
+
+    // Compute-write on CellListBuffer (the atomic counter) → transfer-read.
+    VkBufferMemoryBarrier pre{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    pre.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
+    pre.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    pre.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre.buffer              = h.CellListBuffer;
+    pre.offset              = 0;
+    pre.size                = sizeof(uint32_t);
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 1, &pre, 0, nullptr);
+
+    VkBufferCopy region{};
+    region.srcOffset = 0;
+    region.dstOffset = 0;
+    region.size      = sizeof(uint32_t);
+    vkCmdCopyBuffer(cmd, h.CellListBuffer, h.ReadbackBuffers[frameSlot],
+                    1, &region);
+
+    // Host-coherent: no host-barrier needed beyond the fence wait at BeginFrame.
+}
+
+uint32_t RadianceCascadeHashReadProbeCount(const RadianceCascadeHash& h,
+                                           uint32_t frameSlot) {
+    if (!h.Initialized) return 0;
+    if (frameSlot >= VulkanContext::kFramesInFlight) return 0;
+    if (!h.ReadbackMapped[frameSlot]) return 0;
+    return h.ReadbackMapped[frameSlot][0];
 }
 
 } // namespace RS

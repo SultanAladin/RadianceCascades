@@ -1,5 +1,6 @@
-// Source/Shadow/SDFConeShadow.cpp — Phase 13
+// Source/Shadow/SDFConeShadow.cpp — Phase 13 (+ Phase 15d sparse rewire)
 #include "Shadow/SDFConeShadow.h"
+#include "SDF/GlobalSDF.h"
 #include "Renderer/FrameContext.h"
 #include "Core/Logger.h"
 #include "imgui.h"
@@ -25,6 +26,12 @@ int FindMemoryType(VkPhysicalDevice pd, uint32_t typeBits, VkMemoryPropertyFlags
     return -1;
 }
 
+uint32_t Log2Ceil(uint32_t v) {
+    uint32_t r = 0;
+    while ((1u << r) < v) ++r;
+    return r;
+}
+
 } // namespace
 
 // -- lifecycle ----------------------------------------------------------------
@@ -33,18 +40,22 @@ void SDFConeShadow::Initialize(const VulkanContext& ctx,
                                VkFormat /*depthFormat*/,
                                VkExtent2D /*shadowMapResolution*/) {
     m_Ctx = &ctx;
-    if (!CreateSampler())        { RS_LOG_ERROR("SDFConeShadow: sampler failed");    return; }
-    if (!CreateSetLayout())      { RS_LOG_ERROR("SDFConeShadow: set layout failed"); return; }
-    if (!CreateAlgoUbos())       { RS_LOG_ERROR("SDFConeShadow: UBOs failed");       return; }
-    if (!CreateDescriptorSets()) { RS_LOG_ERROR("SDFConeShadow: sets failed");       return; }
+    if (!CreateSetLayout())          { RS_LOG_ERROR("SDFConeShadow: set layout failed"); return; }
+    if (!CreateAlgoUbos())           { RS_LOG_ERROR("SDFConeShadow: AlgoUbos failed");   return; }
+    if (!CreateSparseParamsUbos())   { RS_LOG_ERROR("SDFConeShadow: SparseUbos failed"); return; }
+    if (!CreateDummySparseBuffers()) { RS_LOG_ERROR("SDFConeShadow: dummies failed");    return; }
+    if (!CreateDescriptorSets())     { RS_LOG_ERROR("SDFConeShadow: sets failed");       return; }
 
-    // Initial descriptor write uses our linear/clamp sampler against a null
-    // view — that's not valid, so SetSDF must be called before the first
-    // RecordShadowPass. Main.cpp does this right after Initialize(); until then
-    // the algo is "not ready". To keep validation quiet on the very first
-    // frame we'll write the sampler with a placeholder view in RewriteAllSets
-    // only after SetSDF has been called.
-    RS_LOG_INFO("SDFConeShadow ready: awaiting SetSDF() to bind the residency view");
+    // Initial sparse params = identity (1^3 dummy AABB). All descriptor sets
+    // are written against the dummy SSBOs so binding is always valid even
+    // before SetSDF supplies a real residency. The shader gates the trace
+    // loop on the StrengthAndFlags.z (hasSDF) flag, so a missing SDF leaves
+    // every pixel fully lit.
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        UpdateSparseParamsUbo(i);
+    }
+    RewriteAllSets();
+    RS_LOG_INFO("SDFConeShadow ready (sparse VDB binding, awaiting SetSDF)");
 }
 
 void SDFConeShadow::Terminate(const VulkanContext& ctx) {
@@ -63,20 +74,30 @@ void SDFConeShadow::Terminate(const VulkanContext& ctx) {
         }
         if (m_AlgoUboBuffers[i]) vkDestroyBuffer(ctx.Device, m_AlgoUboBuffers[i], nullptr);
         if (m_AlgoUboMemory [i]) vkFreeMemory   (ctx.Device, m_AlgoUboMemory [i], nullptr);
+
+        if (m_SparseUboMapped[i]) {
+            vkUnmapMemory(ctx.Device, m_SparseUboMemory[i]);
+            m_SparseUboMapped[i] = nullptr;
+        }
+        if (m_SparseUboBuffers[i]) vkDestroyBuffer(ctx.Device, m_SparseUboBuffers[i], nullptr);
+        if (m_SparseUboMemory [i]) vkFreeMemory   (ctx.Device, m_SparseUboMemory [i], nullptr);
     }
-    m_AlgoUboBuffers = {};
-    m_AlgoUboMemory  = {};
+    m_AlgoUboBuffers   = {};
+    m_AlgoUboMemory    = {};
+    m_SparseUboBuffers = {};
+    m_SparseUboMemory  = {};
 
-    if (m_LinearClampSampler)
-        vkDestroySampler(ctx.Device, m_LinearClampSampler, nullptr);
+    if (m_DummyBuffer) vkDestroyBuffer(ctx.Device, m_DummyBuffer, nullptr);
+    if (m_DummyMemory) vkFreeMemory   (ctx.Device, m_DummyMemory, nullptr);
+    m_DummyBuffer = VK_NULL_HANDLE;
+    m_DummyMemory = VK_NULL_HANDLE;
 
-    m_LinearClampSampler = VK_NULL_HANDLE;
     m_LightingSetLayout  = VK_NULL_HANDLE;
     m_DescriptorPool     = VK_NULL_HANDLE;
     m_FrameSets          = {};
-    m_SdfView            = VK_NULL_HANDLE;
-    m_SdfSampler         = VK_NULL_HANDLE;
     m_HasSDF             = false;
+    m_IndexBuffer        = VK_NULL_HANDLE;
+    m_PoolBuffer         = VK_NULL_HANDLE;
     m_Ctx                = nullptr;
 }
 
@@ -96,7 +117,7 @@ void SDFConeShadow::DrawImGuiParams() {
     ImGui::SliderFloat("Strength",         &m_Params.Strength,      0.0f, 1.0f);
     ImGui::Separator();
     ImGui::TextDisabled(m_HasSDF
-        ? "SDF resident — tracing the active mesh."
+        ? "Sparse SDF resident — tracing the active mesh."
         : "No SDF resident — output stays lit (no shadow).");
 }
 
@@ -105,8 +126,6 @@ void SDFConeShadow::DrawImGuiParams() {
 void SDFConeShadow::RecordShadowPass(VkCommandBuffer /*cmd*/,
                                      const FrameContext& frame) {
     if (!m_Ctx) return;
-    // No render pass to record — the lighting compose itself traces. We only
-    // need to refresh the per-frame UBO with the latest sun + tunables.
     UpdateAlgoUbo(frame.FrameSlot, frame);
 }
 
@@ -124,16 +143,37 @@ void SDFConeShadow::BindLightingDescriptorSet(VkCommandBuffer cmd,
 
 // -- residency hook -----------------------------------------------------------
 
-void SDFConeShadow::SetSDF(VkImageView sdfView, VkSampler sampler,
-                           const glm::vec3& aabbMin, const glm::vec3& aabbMax,
-                           float maxDist, bool hasSDF) {
-    m_SdfView    = sdfView;
-    m_SdfSampler = sampler;
-    m_AabbMin    = aabbMin;
-    m_AabbMax    = aabbMax;
-    m_MaxDist    = maxDist;
-    m_HasSDF     = hasSDF;
+void SDFConeShadow::SetSDF(const ResidentSparseSDF* sparse, bool hasSDF) {
+    if (sparse && hasSDF) {
+        m_HasSDF       = true;
+        m_IndexBuffer  = sparse->IndexBuffer;
+        m_PoolBuffer   = sparse->PoolBuffer;
+        m_IndexBytes   = sparse->IndexBytes;
+        m_PoolBytes    = sparse->PoolBytes;
+
+        const uint32_t bs = sparse->BrickSize ? sparse->BrickSize : 8u;
+        const float decode = sparse->MaxDist > 0.0f
+                                 ? (sparse->MaxDist / 32767.0f)
+                                 : 0.0f;
+        m_SparseParams.AABBMin = glm::vec4(sparse->AABBMin, sparse->MaxDist);
+        m_SparseParams.AABBMax = glm::vec4(sparse->AABBMax, decode);
+        m_SparseParams.Dims    = glm::uvec4(sparse->Resolution,
+                                            bs,
+                                            sparse->BrickGrid,
+                                            Log2Ceil(bs));
+    } else {
+        m_HasSDF       = false;
+        m_IndexBuffer  = VK_NULL_HANDLE;
+        m_PoolBuffer   = VK_NULL_HANDLE;
+        m_IndexBytes   = 0;
+        m_PoolBytes    = 0;
+        m_SparseParams = {};
+    }
+
     if (!m_Ctx || !m_LightingSetLayout) return;
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        UpdateSparseParamsUbo(i);
+    }
     RewriteAllSets();
 }
 
@@ -150,40 +190,35 @@ void SDFConeShadow::SetInstanceXformBuffer(const VkBuffer* ssbosByFrame,
 
 // -- one-time GPU resource creation ------------------------------------------
 
-bool SDFConeShadow::CreateSampler() {
-    // Mirror GlobalSDF::Sampler's filter/clamp settings — the GLSL sampler is
-    // a sampler3D so we use TEXTURE_3D + linear filtering for trilinear taps.
-    VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-    sci.magFilter    = VK_FILTER_LINEAR;
-    sci.minFilter    = VK_FILTER_LINEAR;
-    sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sci.minLod       = 0.0f;
-    sci.maxLod       = 0.0f;
-    return vkCreateSampler(m_Ctx->Device, &sci, nullptr, &m_LinearClampSampler) == VK_SUCCESS;
-}
-
 bool SDFConeShadow::CreateSetLayout() {
-    VkDescriptorSetLayoutBinding bindings[3]{};
+    VkDescriptorSetLayoutBinding bindings[5]{};
+    // 0,1 = sparse SSBOs (BrickIndex + BrickPool)
     bindings[0].binding         = 0;
-    bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = 1;
     bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1] = bindings[0]; bindings[1].binding = 1;
 
-    bindings[1].binding         = 1;
-    bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
+    // 2 = SparseParams UBO
     bindings[2].binding         = 2;
-    bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[2].descriptorCount = 1;
     bindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // 3 = AlgoUbo
+    bindings[3].binding         = 3;
+    bindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    // 4 = InstanceXform SSBO
+    bindings[4].binding         = 4;
+    bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 3;
+    lci.bindingCount = 5;
     lci.pBindings    = bindings;
     return vkCreateDescriptorSetLayout(m_Ctx->Device, &lci, nullptr, &m_LightingSetLayout) == VK_SUCCESS;
 }
@@ -214,18 +249,68 @@ bool SDFConeShadow::CreateAlgoUbos() {
     return true;
 }
 
+bool SDFConeShadow::CreateSparseParamsUbos() {
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.size  = sizeof(SparseParams);
+        bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        if (vkCreateBuffer(m_Ctx->Device, &bci, nullptr, &m_SparseUboBuffers[i]) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(m_Ctx->Device, m_SparseUboBuffers[i], &req);
+        const int memType = FindMemoryType(m_Ctx->PhysicalDevice, req.memoryTypeBits,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (memType < 0) return false;
+
+        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.allocationSize  = req.size;
+        mai.memoryTypeIndex = static_cast<uint32_t>(memType);
+        if (vkAllocateMemory(m_Ctx->Device, &mai, nullptr, &m_SparseUboMemory[i]) != VK_SUCCESS) return false;
+        vkBindBufferMemory(m_Ctx->Device, m_SparseUboBuffers[i], m_SparseUboMemory[i], 0);
+
+        if (vkMapMemory(m_Ctx->Device, m_SparseUboMemory[i], 0, req.size, 0, &m_SparseUboMapped[i]) != VK_SUCCESS) return false;
+        std::memset(m_SparseUboMapped[i], 0, sizeof(SparseParams));
+    }
+    return true;
+}
+
+bool SDFConeShadow::CreateDummySparseBuffers() {
+    // A single 16-byte device-local STORAGE_BUFFER that backs both binding 0
+    // and binding 1 when no real sparse SDF is resident. The shader never
+    // reads it (hasSDF flag short-circuits the trace) — this just keeps the
+    // descriptor write valid.
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size  = 16;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (vkCreateBuffer(m_Ctx->Device, &bci, nullptr, &m_DummyBuffer) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(m_Ctx->Device, m_DummyBuffer, &req);
+    const int memType = FindMemoryType(m_Ctx->PhysicalDevice, req.memoryTypeBits,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memType < 0) return false;
+
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize  = req.size;
+    mai.memoryTypeIndex = static_cast<uint32_t>(memType);
+    if (vkAllocateMemory(m_Ctx->Device, &mai, nullptr, &m_DummyMemory) != VK_SUCCESS) return false;
+    vkBindBufferMemory(m_Ctx->Device, m_DummyBuffer, m_DummyMemory, 0);
+    return true;
+}
+
 bool SDFConeShadow::CreateDescriptorSets() {
-    VkDescriptorPoolSize sizes[3]{};
-    sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = VulkanContext::kFramesInFlight;
+    VkDescriptorPoolSize sizes[2]{};
+    // Sparse SSBOs (2) + xform SSBO (1) = 3 per frame
+    sizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[0].descriptorCount = 3 * VulkanContext::kFramesInFlight;
+    // SparseParams + AlgoUbo = 2 per frame
     sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    sizes[1].descriptorCount = VulkanContext::kFramesInFlight;
-    sizes[2].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[2].descriptorCount = VulkanContext::kFramesInFlight;
+    sizes[1].descriptorCount = 2 * VulkanContext::kFramesInFlight;
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets       = VulkanContext::kFramesInFlight;
-    pci.poolSizeCount = 3;
+    pci.poolSizeCount = 2;
     pci.pPoolSizes    = sizes;
     if (vkCreateDescriptorPool(m_Ctx->Device, &pci, nullptr, &m_DescriptorPool) != VK_SUCCESS) return false;
 
@@ -238,24 +323,36 @@ bool SDFConeShadow::CreateDescriptorSets() {
     ai.pSetLayouts        = layouts;
     if (vkAllocateDescriptorSets(m_Ctx->Device, &ai, m_FrameSets.data()) != VK_SUCCESS) return false;
 
-    // UBO bindings are stable (only contents move). Image binding (0) is left
-    // unwritten until SetSDF() supplies a real view — validation accepts this
-    // because we never bind the set before then; Main.cpp calls SetSDF before
-    // the first frame.
+    // Stable UBO bindings (binding 2 = SparseParams, binding 3 = AlgoUbo).
+    // SSBO bindings (0, 1, 4) are written by RewriteAllSets — but the dummy
+    // sparse buffer + InstXform=null path means the first call from
+    // Initialize already writes valid storage to keep validation quiet.
     for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
-        VkDescriptorBufferInfo buf{};
-        buf.buffer = m_AlgoUboBuffers[i];
-        buf.offset = 0;
-        buf.range  = sizeof(AlgoUbo);
+        VkDescriptorBufferInfo sparseUbo{};
+        sparseUbo.buffer = m_SparseUboBuffers[i];
+        sparseUbo.offset = 0;
+        sparseUbo.range  = sizeof(SparseParams);
+        VkDescriptorBufferInfo algoUbo{};
+        algoUbo.buffer = m_AlgoUboBuffers[i];
+        algoUbo.offset = 0;
+        algoUbo.range  = sizeof(AlgoUbo);
 
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = m_FrameSets[i];
-        w.dstBinding      = 1;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w.pBufferInfo     = &buf;
-        vkUpdateDescriptorSets(m_Ctx->Device, 1, &w, 0, nullptr);
+        VkWriteDescriptorSet w[2]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = m_FrameSets[i];
+        w[0].dstBinding = 2;
+        w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].pBufferInfo = &sparseUbo;
+
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = m_FrameSets[i];
+        w[1].dstBinding = 3;
+        w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[1].pBufferInfo = &algoUbo;
+
+        vkUpdateDescriptorSets(m_Ctx->Device, 2, w, 0, nullptr);
     }
     return true;
 }
@@ -265,66 +362,72 @@ void SDFConeShadow::RewriteAllSets() {
     vkDeviceWaitIdle(m_Ctx->Device);
 
     for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
-        VkWriteDescriptorSet writes[2]{};
-        VkDescriptorImageInfo  img{};
-        VkDescriptorBufferInfo buf{};
+        // Bindings 0 (BrickIndex), 1 (BrickPool), and 4 (InstXform).
+        VkDescriptorBufferInfo idxInfo{}, poolInfo{}, xformInfo{};
+        idxInfo.buffer = m_HasSDF && m_IndexBuffer ? m_IndexBuffer : m_DummyBuffer;
+        idxInfo.offset = 0;
+        idxInfo.range  = m_HasSDF && m_IndexBuffer ? m_IndexBytes : 16;
+
+        poolInfo.buffer = m_HasSDF && m_PoolBuffer ? m_PoolBuffer : m_DummyBuffer;
+        poolInfo.offset = 0;
+        poolInfo.range  = m_HasSDF && m_PoolBuffer ? m_PoolBytes : 16;
+
+        VkWriteDescriptorSet writes[3]{};
         uint32_t n = 0;
 
-        if (m_SdfView != VK_NULL_HANDLE) {
-            img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            img.imageView   = m_SdfView;
-            // Prefer the panel-supplied sampler (GlobalSDF::Sampler) when present;
-            // fall back to our own linear/clamp sampler. They're functionally
-            // identical — this just avoids a redundant VkSampler.
-            img.sampler     = (m_SdfSampler != VK_NULL_HANDLE)
-                                  ? m_SdfSampler : m_LinearClampSampler;
+        writes[n].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[n].dstSet          = m_FrameSets[i];
+        writes[n].dstBinding      = 0;
+        writes[n].descriptorCount = 1;
+        writes[n].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[n].pBufferInfo     = &idxInfo;
+        ++n;
 
-            writes[n].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[n].dstSet          = m_FrameSets[i];
-            writes[n].dstBinding      = 0;
-            writes[n].descriptorCount = 1;
-            writes[n].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[n].pImageInfo      = &img;
-            ++n;
-        }
+        writes[n].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[n].dstSet          = m_FrameSets[i];
+        writes[n].dstBinding      = 1;
+        writes[n].descriptorCount = 1;
+        writes[n].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[n].pBufferInfo     = &poolInfo;
+        ++n;
 
         if (m_InstXformBuffers[i] != VK_NULL_HANDLE && m_XformBytes > 0) {
-            buf.buffer = m_InstXformBuffers[i];
-            buf.offset = 0;
-            buf.range  = m_XformBytes;
+            xformInfo.buffer = m_InstXformBuffers[i];
+            xformInfo.offset = 0;
+            xformInfo.range  = m_XformBytes;
 
             writes[n].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[n].dstSet          = m_FrameSets[i];
-            writes[n].dstBinding      = 2;
+            writes[n].dstBinding      = 4;
             writes[n].descriptorCount = 1;
             writes[n].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[n].pBufferInfo     = &buf;
+            writes[n].pBufferInfo     = &xformInfo;
             ++n;
         }
 
-        if (n > 0) {
-            vkUpdateDescriptorSets(m_Ctx->Device, n, writes, 0, nullptr);
-        }
+        vkUpdateDescriptorSets(m_Ctx->Device, n, writes, 0, nullptr);
     }
 }
 
 void SDFConeShadow::UpdateAlgoUbo(uint32_t frameSlot, const FrameContext& frame) {
     AlgoUbo ubo{};
-    // FrameContext.SunDirection points TOWARD the sun (matches lighting.comp's
-    // pc.SunDirAndIntensity convention).
     const float halfAngleRad = m_Params.HalfAngleDeg * (kPi / 180.0f);
-    ubo.SunDirAndHalfAngle   = glm::vec4(glm::normalize(frame.SunDirection),
-                                         halfAngleRad);
-    ubo.AABBMinAndMaxDist    = glm::vec4(m_AabbMin, m_MaxDist);
-    ubo.AABBMaxAndSurfaceOff = glm::vec4(m_AabbMax, m_Params.SurfaceOffset);
-    ubo.TraceParams          = glm::vec4(static_cast<float>(m_Params.MaxSteps),
-                                         m_Params.MaxDistance,
-                                         m_Params.MinStep,
-                                         m_Params.Strength);
-    ubo.Flags                = glm::vec4(m_Params.Enabled ? 1.0f : 0.0f,
-                                         m_HasSDF         ? 1.0f : 0.0f,
-                                         0.0f, 0.0f);
+    ubo.SunDirAndHalfAngle    = glm::vec4(glm::normalize(frame.SunDirection),
+                                          halfAngleRad);
+    ubo.TraceParamsAndSurfOff = glm::vec4(static_cast<float>(m_Params.MaxSteps),
+                                          m_Params.MaxDistance,
+                                          m_Params.MinStep,
+                                          m_Params.SurfaceOffset);
+    ubo.StrengthAndFlags      = glm::vec4(m_Params.Strength,
+                                          m_Params.Enabled ? 1.0f : 0.0f,
+                                          m_HasSDF         ? 1.0f : 0.0f,
+                                          0.0f);
     std::memcpy(m_AlgoUboMapped[frameSlot], &ubo, sizeof(ubo));
+}
+
+void SDFConeShadow::UpdateSparseParamsUbo(uint32_t frameSlot) {
+    if (!m_SparseUboMapped[frameSlot]) return;
+    std::memcpy(m_SparseUboMapped[frameSlot], &m_SparseParams, sizeof(SparseParams));
 }
 
 } // namespace RS

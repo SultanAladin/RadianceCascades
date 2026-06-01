@@ -94,6 +94,14 @@ struct RadianceCascadeHash {
     std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> ParamsMemory{};
     std::array<void*,          VulkanContext::kFramesInFlight> ParamsMapped{};
 
+    // Phase 14c: 4-byte host-visible ring for CellList[0] readback. Each
+    // RecordGather records a `vkCmdCopyBuffer(CellList, ReadbackBuffers[slot], 4)`
+    // for the current frame slot; the host reads it the next time that slot
+    // wakes (after BeginFrame's fence wait). 1-frame stale, no stall.
+    std::array<VkBuffer,       VulkanContext::kFramesInFlight> ReadbackBuffers{};
+    std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> ReadbackMemory{};
+    std::array<uint32_t*,      VulkanContext::kFramesInFlight> ReadbackMapped{};
+
     VkDescriptorSetLayout SetLayout      = VK_NULL_HANDLE;   // set=3 / set=0
     VkDescriptorPool      DescriptorPool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, VulkanContext::kFramesInFlight> Sets{};
@@ -119,5 +127,19 @@ void RadianceCascadeHashWriteParams(RadianceCascadeHash& h,
 // frame.
 void RadianceCascadeHashClearForFrame(const RadianceCascadeHash& h,
                                       VkCommandBuffer cmd);
+
+// Phase 14c: copy CellList[0] (occupied probe counter) into ReadbackBuffers[slot]
+// for host-side stats. Records a compute->transfer barrier on CellListBuffer
+// first. The host reads via RadianceCascadeHashReadProbeCount the next time
+// this slot wakes.
+void RadianceCascadeHashRecordReadback(const RadianceCascadeHash& h,
+                                       VkCommandBuffer cmd,
+                                       uint32_t frameSlot);
+
+// Phase 14c: read the most-recently-staged probe count for any slot. Returns 0
+// if uninitialised or if the slot has never been written. Safe to call on the
+// host any time; the caller must have waited the slot's fence (BeginFrame does).
+uint32_t RadianceCascadeHashReadProbeCount(const RadianceCascadeHash& h,
+                                           uint32_t frameSlot);
 
 } // namespace RS

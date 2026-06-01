@@ -1,0 +1,125 @@
+#version 450
+// Phase B — SkyView LUT (Hillaire 2020 §5.3).
+// Per-frame (when the sun moves) raymarched hemisphere of sky radiance
+// observed from current camera altitude. Stored at 192×108 RGBA16F so the
+// horizon band has dense azimuth coverage.
+//
+// Workgroup 8×8.
+
+#extension GL_GOOGLE_include_directive : require
+#include "include/atmosphere.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uTransmittance;
+layout(set = 0, binding = 1) uniform sampler2D uMultiScatter;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D uSkyView;
+
+layout(push_constant) uniform Push {
+    AtmosphereParams Atmo;
+    vec4             SunDirAndSkyGain;   // xyz = sun dir (toward sun), w = sky inscatter gain
+    vec4             SunColorAndSize;    // rgb = sun color × sun intensity, w = sun half-angle (rad)
+    vec4             ViewSize;           // x = width, y = height, z = steps, w = cameraAltitudeKm
+} pc;
+
+vec3 SampleTransmittance(AtmoCoeffs c, float r, float mu) {
+    float tP = RaySphereIntersectNearest(vec3(0.0, 0.0, r), vec3(sqrt(max(1.0 - mu * mu, 0.0)), 0.0, mu), c.PlanetRadiusKm);
+    if (tP >= 0.0) {
+        return vec3(0.0);
+    }
+    vec2 uv = TransmittanceUVFromRMu(r, mu, c.PlanetRadiusKm, c.AtmoRadiusKm);
+    return textureLod(uTransmittance, uv, 0.0).rgb;
+}
+
+vec3 SampleMultiScatter(AtmoCoeffs c, float r, float muSun) {
+    float altRatio = clamp((r - c.PlanetRadiusKm) / max(c.AtmoRadiusKm - c.PlanetRadiusKm, 1e-3), 0.0, 1.0);
+    vec2 uv = vec2(muSun * 0.5 + 0.5, altRatio);
+    return textureLod(uMultiScatter, uv, 0.0).rgb;
+}
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= uint(pc.ViewSize.x) || px.y >= uint(pc.ViewSize.y)) return;
+
+    AtmoCoeffs c = UnpackAtmoCoeffs(pc.Atmo);
+
+    // Camera radius (km from planet centre).
+    float camAltKm = max(pc.ViewSize.w, 0.001);
+    float r        = c.PlanetRadiusKm + camAltKm;
+    vec3  ro       = vec3(0.0, 0.0, r);
+    vec3  up       = vec3(0.0, 0.0, 1.0);
+    vec3  forward  = vec3(0.0, 1.0, 0.0);
+    vec3  right    = vec3(1.0, 0.0, 0.0);
+
+    // Decode dir from UV.
+    vec2 uv  = (vec2(px) + 0.5) / pc.ViewSize.xy;
+    vec3 rd  = DirFromSkyViewUV(uv, up, right, forward);
+
+    // Sun direction in the same local frame (host already packs it that way).
+    vec3 sunDir = normalize(pc.SunDirAndSkyGain.xyz);
+
+    // Determine ray end: atmosphere top, clipped by planet if we're aimed down.
+    float tEnd    = RaySphereExit(ro, rd, c.AtmoRadiusKm);
+    float tPlanet = RaySphereIntersectNearest(ro, rd, c.PlanetRadiusKm);
+    if (tPlanet > 0.0) tEnd = min(tEnd, tPlanet);
+
+    int   steps = int(max(pc.ViewSize.z, 16.0));
+    float dt_km = tEnd / float(steps);
+    float dt_m  = dt_km * 1000.0;
+
+    float cosTheta = clamp(dot(rd, sunDir), -1.0, 1.0);
+    float phaseR   = RayleighPhase(cosTheta);
+    float phaseM   = MiePhase(cosTheta, c.MieG);
+
+    vec3 transmittanceCam = vec3(1.0);
+    vec3 L = vec3(0.0);
+
+    for (int i = 0; i < steps; ++i) {
+        float t   = (float(i) + 0.5) * dt_km;
+        vec3  pos = ro + rd * t;
+        float rr  = length(pos);
+        float alt = max(rr - c.PlanetRadiusKm, 0.0);
+
+        vec3 extinction = SampleExtinction(c, alt);
+        vec3 segTrans   = exp(-extinction * dt_m);
+
+        vec3  sRayleigh; float sMie;
+        SampleScattering(c, alt, sRayleigh, sMie);
+
+        // Sun transmittance to this sample.
+        vec3  upP    = pos / rr;
+        float muSun  = clamp(dot(upP, sunDir), -1.0, 1.0);
+        vec3  trSun  = SampleTransmittance(c, rr, muSun);
+
+        // Single scatter (phase-weighted).
+        vec3 singleScatter = (sRayleigh * phaseR + vec3(sMie) * phaseM) * trSun;
+
+        // Multi scatter (isotropic — comes pre-multiplied by sun irradiance).
+        vec3 multiScatter  = (sRayleigh + vec3(sMie)) * SampleMultiScatter(c, rr, muSun);
+
+        vec3 totalIn       = singleScatter + multiScatter;
+        vec3 segIntegral   = (totalIn - totalIn * segTrans) / max(extinction, vec3(1e-6));
+        L += transmittanceCam * segIntegral;
+
+        transmittanceCam *= segTrans;
+    }
+
+    // Sky gain controls the inscatter contribution only — decoupled from sun
+    // intensity so the IBL ambient stays tame when the sun disc is dialed up.
+    L *= pc.SunDirAndSkyGain.w;
+
+    // Analytic sun disc — only if we're not occluded by the planet.
+    if (tPlanet < 0.0) {
+        float aperture = max(pc.SunColorAndSize.w, 0.0005);
+        float cosAper  = cos(aperture);
+        float cosEdge  = cos(aperture + 0.00087);
+        float discMask = smoothstep(cosEdge, cosAper, cosTheta);
+        // Sun seen through atmospheric transmittance. SunColorAndSize.rgb is
+        // already pre-multiplied by sun intensity by the host.
+        float muView   = clamp(dot(up, rd), -1.0, 1.0);
+        vec3  trView   = SampleTransmittance(c, r, muView);
+        L += pc.SunColorAndSize.rgb * discMask * trView;
+    }
+
+    imageStore(uSkyView, ivec2(px), vec4(L, 1.0));
+}

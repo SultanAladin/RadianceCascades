@@ -402,23 +402,39 @@ void KickBake(SdfBakerState& s, const VulkanContext& ctx,
 
     s.BakeInFlight = true;
     s.Progress     = std::make_shared<BakeProgress>();
-    s.PendingUpload= std::make_shared<BakedSDF>();
     s.WorkerDone.store(false, std::memory_order_release);
 
-    // Worker captures by value where possible. The VulkanContext is read-only
-    // (we only call vkMapMemory inside the worker on host-visible memory,
-    // which is safe — vkMapMemory + vkUnmapMemory don't require external
-    // synchronisation when the memory is HOST_VISIBLE | HOST_COHERENT).
     std::shared_ptr<BakeProgress> progress = s.Progress;
-    std::shared_ptr<BakedSDF>     pending  = s.PendingUpload;
     std::atomic<bool>*            done     = &s.WorkerDone;
     const VulkanContext* ctxPtr = &ctx;
     const GpuMesh* meshPtr = gpuMesh;
 
-    s.Worker = std::thread([progress, pending, done, ctxPtr, meshPtr, resolution, algorithmChoice]() {
-        *pending = MeshSDFBakerBake(*ctxPtr, *meshPtr, resolution, progress.get(), algorithmChoice);
-        done->store(true, std::memory_order_release);
-    });
+    // Phase 15a: branch on UseSparse. Dense path bakes BakedSDF (host-side
+    // res^3 int16); sparse path bakes BakedSparseSDF brick-by-brick with peak
+    // RAM dominated by occupied-bricks × brickSize^3.
+    if (s.UseSparse) {
+        s.PendingUpload.reset();
+        s.PendingUploadSparse = std::make_shared<BakedSparseSDF>();
+        std::shared_ptr<BakedSparseSDF> pending = s.PendingUploadSparse;
+        const uint32_t brickSize = BrickSizePx(s.BrickSizeChoice);
+        s.Worker = std::thread([progress, pending, done, ctxPtr, meshPtr,
+                                resolution, brickSize, algorithmChoice]() {
+            *pending = MeshSDFBakerBakeSparse(*ctxPtr, *meshPtr, resolution,
+                                              brickSize, progress.get(),
+                                              algorithmChoice);
+            done->store(true, std::memory_order_release);
+        });
+    } else {
+        s.PendingUploadSparse.reset();
+        s.PendingUpload = std::make_shared<BakedSDF>();
+        std::shared_ptr<BakedSDF> pending = s.PendingUpload;
+        s.Worker = std::thread([progress, pending, done, ctxPtr, meshPtr,
+                                resolution, algorithmChoice]() {
+            *pending = MeshSDFBakerBake(*ctxPtr, *meshPtr, resolution,
+                                        progress.get(), algorithmChoice);
+            done->store(true, std::memory_order_release);
+        });
+    }
 }
 
 void RefreshStatsFromBaked(SdfBakerState& s, const BakedSDF& baked,
@@ -445,17 +461,77 @@ void FinaliseBake(SdfBakerState& s, const VulkanContext& ctx, GlobalSDF& globalS
     s.BakeInFlight = false;
     s.WorkerDone.store(false, std::memory_order_release);
 
+    const double durationMs = s.Progress
+        ? s.Progress->DurationMs.load(std::memory_order_relaxed) : 0.0;
+    const uint32_t triCount = s.Progress
+        ? s.Progress->TriangleCount.load(std::memory_order_relaxed) : 0u;
+
+    // Phase 15a: which pending bake did KickBake produce?
+    const bool sparsePath = static_cast<bool>(s.PendingUploadSparse);
+
+    if (sparsePath) {
+        if (!s.PendingUploadSparse || s.PendingUploadSparse->Resolution == 0 ||
+            s.PendingUploadSparse->BrickIndex.empty()) {
+            RS_LOG_INFO("SdfBaker: sparse bake produced no bricks (cancelled or empty)");
+            s.PendingUploadSparse.reset();
+            s.Progress.reset();
+            return;
+        }
+        BakedSparseSDF& sparse = *s.PendingUploadSparse;
+
+        SeedOutputBuffersFromMesh(s);
+        const std::string sparsePath = ComposeSparseOutputPath(s,
+            sparse.Resolution, sparse.BrickSize);
+        EnsureDirRecursive(s.OutputDirBuf.data());
+        const bool sparseSaved = SDFCacheSaveSparse(sparsePath.c_str(), sparse);
+        const ResidentSparseSDF rs = GlobalSDFUploadSparse(globalSdf, ctx,
+                                                           s.TargetMesh, sparse,
+                                                           /*fromCache*/ false);
+        if (rs.IndexBuffer == VK_NULL_HANDLE) {
+            RS_LOG_ERROR("SdfBaker: sparse upload failed");
+        } else {
+            outResidencyChanged = true;
+        }
+
+        // Slice preview is dense-only for now (Phase 15f promotes it to sparse-
+        // aware). Leave ResidentBakedCopy alone — the preview pane sits at its
+        // initial grey if the user only baked sparse.
+
+        // Dense stats are intentionally cleared so the panel doesn't show
+        // stale dense numbers next to a freshly-baked sparse-only run.
+        s.Stats.Valid          = false;
+        s.Stats.FromCache      = false;
+        s.Stats.Resolution     = sparse.Resolution;
+        s.Stats.VoxelCount     = 0;
+        s.Stats.CpuBytes       = 0;
+        s.Stats.GpuBytes       = 0;
+        s.Stats.DiskBytes      = 0;
+        s.Stats.BakeDurationMs = durationMs;
+        s.Stats.TriangleCount  = triCount;
+        s.Stats.MaxDist        = sparse.MaxDist;
+        s.Stats.LastSavedPath.clear();
+
+        s.Stats.SparseValid           = (rs.IndexBuffer != VK_NULL_HANDLE);
+        s.Stats.SparseBrickSize       = sparse.BrickSize;
+        s.Stats.SparseOccupiedBricks  = sparse.OccupiedBrickCount;
+        s.Stats.SparseTotalBricks     = static_cast<uint32_t>(sparse.BrickIndex.size());
+        s.Stats.SparseGpuBytes        = rs.IndexBytes + rs.PoolBytes;
+        s.Stats.SparseDiskBytes       = sparseSaved
+            ? QueryFileSize(sparsePath.c_str()) : 0u;
+        s.Stats.SparseLastSavedPath   = sparseSaved ? sparsePath : std::string{};
+
+        s.PendingUploadSparse.reset();
+        s.Progress.reset();
+        return;
+    }
+
+    // Dense path (unchanged).
     if (!s.PendingUpload || s.PendingUpload->Voxels.empty()) {
         RS_LOG_INFO("SdfBaker: bake produced no voxels (cancelled or empty)");
         s.PendingUpload.reset();
         s.Progress.reset();
         return;
     }
-
-    const double durationMs = s.Progress
-        ? s.Progress->DurationMs.load(std::memory_order_relaxed) : 0.0;
-    const uint32_t triCount = s.Progress
-        ? s.Progress->TriangleCount.load(std::memory_order_relaxed) : 0u;
 
     const ResidentSDF r = GlobalSDFUploadBaked(globalSdf, ctx, s.TargetMesh,
                                                *s.PendingUpload, /*fromCache*/ false);
@@ -478,9 +554,10 @@ void FinaliseBake(SdfBakerState& s, const VulkanContext& ctx, GlobalSDF& globalS
     RefreshStatsFromBaked(s, *s.PendingUpload, /*fromCache*/ false,
                           durationMs, triCount, savedPath);
 
-    // Sparse VDB-style follow-on. Build from the dense voxels in memory (no
-    // re-walking the BVH), save to .rsdfvdb, and upload to the sparse residency
-    // table alongside the dense one.
+    // Sparse VDB-style follow-on for the *dense* path: pack the in-memory
+    // voxels and also save/upload the sparse variant. Kept for back-compat
+    // with the Phase 14.5 workflow (dense + sparse co-resident). When UseSparse
+    // is on, KickBake takes the sparse-native branch above and this is skipped.
     if (s.UseSparse && r.Image != VK_NULL_HANDLE) {
         const uint32_t brickSize = BrickSizePx(s.BrickSizeChoice);
         BakedSparseSDF sparse = SDFCacheBuildSparse(*s.PendingUpload, brickSize);
@@ -628,6 +705,18 @@ bool SdfBakerPanelDrawAndPump(SdfBakerState& s,
                           "Grayscale: |d| → grey ramp.\n"
                           "Signed B/W: inside black, outside white.\n"
                           "Gradient mag: |∇SDF| (should be ≈1 for clean bakes).");
+    }
+
+    // Phase 15f — main-viewport SDFSlice mode picks dense vs sparse residency.
+    // The CPU slice preview always uses the dense bake (sparse decode on the
+    // CPU side is a Phase 15g consideration if it shows up).
+    static const char* kSliceSourceLabels[] = { "Dense .rsdf", "Sparse .rsdfvdb" };
+    ImGui::Combo("Slice source (viewport)", &s.SliceSourceChoice,
+                 kSliceSourceLabels, IM_ARRAYSIZE(kSliceSourceLabels));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Switches the viewport SDFSlice debug view between\n"
+                          "the legacy dense 3D texture and the sparse VDB SSBOs.\n"
+                          "Falls back to dense if no sparse residency exists.");
     }
 
     // Sparse VDB-style storage -------------------------------------------
@@ -849,8 +938,30 @@ SDFSliceState SdfBakerComposeSliceState(const SdfBakerState& s,
         out.MaxDist = 1.0f;
         out.HasSDF  = false;
     }
+
+    // Phase 15f sparse mirror — populated independently of dense residency so
+    // the viewport's slice mode can switch sources without re-baking.
+    const ResidentSparseSDF* rs = GlobalSDFGetSparse(globalSdf, s.TargetMesh);
+    if (rs) {
+        out.SparseAABBMin   = rs->AABBMin;
+        out.SparseAABBMax   = rs->AABBMax;
+        out.SparseMaxDist   = rs->MaxDist;
+        out.SparseRes       = rs->Resolution;
+        out.SparseBrickSz   = rs->BrickSize;
+        out.SparseBrickGrid = rs->BrickGrid;
+    }
+
+    // Slice-source preference falls back to Dense when sparse residency is
+    // missing (avoids a black viewport on the legacy 4 cached .rsdf files).
+    const bool wantSparse = (s.SliceSourceChoice == 1) && (rs != nullptr);
+    out.Source = wantSparse ? SDFSliceSource::Sparse : SDFSliceSource::Dense;
+
+    // Plane uses whichever AABB the active source owns so the slider tracks
+    // the right voxel band.
+    const glm::vec3 planeMin = wantSparse ? out.SparseAABBMin : out.AABBMin;
+    const glm::vec3 planeMax = wantSparse ? out.SparseAABBMax : out.AABBMax;
     const float t = std::clamp(s.SlicePlaneY01, 0.0f, 1.0f);
-    out.PlaneY = glm::mix(out.AABBMin.y, out.AABBMax.y, t);
+    out.PlaneY = glm::mix(planeMin.y, planeMax.y, t);
     out.VizMode = static_cast<SDFVizMode>(std::clamp(s.VizModeChoice, 0, 4));
     return out;
 }

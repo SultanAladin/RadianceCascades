@@ -163,18 +163,32 @@ void DrawMaterialsPanel(PanelSelection& sel, MaterialRegistry& materials,
         }
         ImGui::EndChild();
 
+        // ---- + New Material --------------------------------------------
+        if (ImGui::Button("+ New Material")) {
+            PbrMaterial blank{};
+            std::snprintf(blank.Name, sizeof(blank.Name),
+                          "Material %u", static_cast<uint32_t>(matCount));
+            sel.SelectedMaterial = materials.Create(blank);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(defaults; rename/edit below)");
+
         // ---- Channels editor --------------------------------------------
         ImGui::TextUnformatted("Channels");
         ImGui::Separator();
         if (sel.SelectedMaterial < matCount) {
             PbrMaterial& m = materials.Get(sel.SelectedMaterial);
             ImGui::InputText("Name", m.Name, sizeof(m.Name));
-            ImGui::ColorEdit3 ("Albedo",    &m.AlbedoFlat.x);
-            ImGui::SliderFloat("AO",        &m.AOFlat,        0.0f, 1.0f);
-            ImGui::SliderFloat("Metallic",  &m.MetallicFlat,  0.0f, 1.0f);
-            ImGui::SliderFloat("Roughness", &m.RoughnessFlat, 0.04f, 1.0f);
-            ImGui::ColorEdit3 ("F0",        &m.F0Flat.x);
-            ImGui::ColorEdit3 ("Emissive",  &m.EmissiveFlat.x,
+            ImGui::ColorEdit3 ("Albedo",         &m.AlbedoFlat.x);
+            ImGui::SliderFloat("AO",             &m.AOFlat,        0.0f, 1.0f);
+            ImGui::SliderFloat("Metallic",       &m.MetallicFlat,  0.0f, 1.0f);
+            ImGui::SliderFloat("Roughness",      &m.RoughnessFlat, 0.04f, 1.0f);
+            ImGui::ColorEdit3 ("Specular Color", &m.F0Flat.x);
+            ImGui::SliderFloat("Specular Factor",&m.SpecularFactorFlat, 0.0f, 1.0f);
+            if (m.MetallicFlat > 0.99f) {
+                ImGui::TextDisabled("(Specular Color/Factor ignored on metals)");
+            }
+            ImGui::ColorEdit3 ("Emissive",   &m.EmissiveFlat.x,
                                ImGuiColorEditFlags_HDR | ImGuiColorEditFlags_Float);
         } else {
             ImGui::TextDisabled("No material selected.");

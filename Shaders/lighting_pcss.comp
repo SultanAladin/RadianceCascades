@@ -4,7 +4,11 @@
 // sampler2DArray for blocker search). Replaces the variant=0 PCF filter with a
 // 3-step PCSS: blocker search → penumbra estimate → wide PCF.
 
+#extension GL_GOOGLE_include_directive : require
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#include "include/pbr_brdf.glsl"
 
 // ----------------------- set=1 GBuffer + IBL + output ------------------------
 layout(set = 1, binding = 0) uniform sampler2D    uAlbedo;
@@ -17,6 +21,7 @@ layout(set = 1, binding = 6) uniform samplerCube  uIrradiance;
 layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
 layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
 layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
+layout(set = 1, binding = 10) uniform sampler2D   uSpecular;
 
 // ----------------------- set=2 PCSS contract ---------------------------------
 layout(set = 2, binding = 0) uniform sampler2DArrayShadow uShadowAtlas;       // compare-LESS, for PCF taps
@@ -38,27 +43,7 @@ layout(push_constant) uniform Push {
     vec4 ResAndFlags;
 } pc;
 
-const float kPI = 3.14159265359;
-
-float D_GGX(float NdotH, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float d  = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / (kPI * d * d + 1e-5);
-}
-float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
-    float a    = roughness * roughness;
-    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
-    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
-    return 0.5 / max(ggxV + ggxL, 1e-5);
-}
-vec3 F_Schlick(float VdotH, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-}
-vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
-    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
+// BRDF math lives in include/pbr_brdf.glsl.
 
 // Vogel disk — 32 deterministic sample directions on a unit disk.
 vec2 VogelDisk(int i, int n, float phi) {
@@ -140,15 +125,18 @@ void main() {
         return;
     }
 
-    vec3 albedo = texture(uAlbedo,   uv).rgb;
-    vec3 encN   = texture(uNormal,   uv).rgb;
-    vec3 rmf    = texture(uRMF,      uv).rgb;
-    vec3 emiss  = texture(uEmissive, uv).rgb;
+    vec4 albedoAO = texture(uAlbedo,   uv);
+    vec3 albedo   = albedoAO.rgb;
+    float ao      = albedoAO.a;
+    vec3 encN     = texture(uNormal,   uv).rgb;
+    vec3 rmf      = texture(uRMF,      uv).rgb;
+    vec3 emiss    = texture(uEmissive, uv).rgb;
+    vec3 specCol  = texture(uSpecular, uv).rgb;
 
     vec3  N         = normalize(encN * 2.0 - 1.0);
     float roughness = max(rmf.r, 0.04);
     float metallic  = rmf.g;
-    float F0Scalar  = rmf.b;
+    float specFact  = rmf.b;
 
     vec4 ndc      = vec4(uv * 2.0 - 1.0, depth, 1.0);
     vec4 worldH   = pc.InvViewProj * ndc;
@@ -161,22 +149,32 @@ void main() {
     float NdotV = max(dot(N, V), 1e-3);
     float NdotH = max(dot(N, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
+    float LdotV = dot(L, V);
 
-    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    vec3 F0 = ComputeF0_KHR(albedo, metallic, specCol, specFact);
+
+    uint flags     = UnpackPbrFlags(pc.IblParams.w);
+    bool realistic = IsRealisticPbr(flags);
+
     float D  = D_GGX(NdotH, roughness);
     float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
     vec3  F  = F_Schlick(VdotH, F0);
 
     vec3 specular = D * Vt * F;
     vec3 kS       = F;
-    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
-    vec3 diffuse  = kD * albedo / kPI;
+    vec3 kD       = (vec3(1.0) - kS) * (1.0 - metallic);
+    vec3 diffuse  = realistic
+        ? kD * Diffuse_EON(albedo, NdotV, NdotL, LdotV, roughness)
+        : kD * albedo * kInvPI;
+
+    vec2 brdfLut = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
+    vec3 ecomp   = realistic ? EnergyCompFactor(F0, brdfLut) : vec3(1.0);
 
     float viewDepth = length(pc.EyePosWorld.xyz - worldPos);
     float shadow    = SamplePcssShadow(worldPos, N, viewDepth, vec2(px));
 
     vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;
-    vec3 lit = (diffuse + specular) * sunRadiance * NdotL * shadow;
+    vec3 lit = (diffuse + specular * ecomp) * sunRadiance * NdotL * shadow;
 
     vec3 ambient;
     if (pc.IblParams.x >= 0.5) {
@@ -186,12 +184,15 @@ void main() {
         vec3 kD_ibl  = (vec3(1.0) - Fr) * (1.0 - metallic);
         float mips   = max(pc.IblParams.z - 1.0, 0.0);
         vec3 prefilt = textureLod(uPrefilter, R, roughness * mips).rgb;
-        vec2 brdf    = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
-        vec3 specIBL = prefilt * (Fr * brdf.x + brdf.y);
-        ambient = (kD_ibl * irr * albedo + specIBL) * pc.IblParams.y;
+        vec3 specIBL = prefilt * (Fr * brdfLut.x + brdfLut.y) * ecomp;
+        vec3 diffIBL = realistic
+            ? kD_ibl * irr * Diffuse_EON(albedo, NdotV, 1.0, 1.0, roughness) * kPI
+            : kD_ibl * irr * albedo;
+        ambient = (diffIBL + specIBL) * pc.IblParams.y;
     } else {
         ambient = albedo * pc.EyePosWorld.w;
     }
+    ambient *= ao;
 
     imageStore(uLightHDR, px, vec4(lit + ambient + emiss, 1.0));
 }

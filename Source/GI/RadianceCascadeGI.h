@@ -28,6 +28,7 @@ namespace RS {
 
 struct OffscreenTargets;
 struct GlobalSDF;
+struct ResidentSparseSDF;
 
 class RadianceCascadeGI final : public IGIAlgorithm {
 public:
@@ -41,11 +42,10 @@ public:
     void SetFrameResources(const OffscreenTargets* targets, const GlobalSDF* sdf,
                           const char* shaderArtifactsDir);
 
-    // Push the resident SDF view in. Mirrors SDFConeShadow::SetSDF — called
-    // from the same residency-changed branch in Main.cpp.
-    void SetSDFView(VkImageView view, VkSampler sampler,
-                    const glm::vec3& aabbMin, const glm::vec3& aabbMax,
-                    float maxDist, bool hasSDF);
+    // Phase 15e: push the sparse SDF residency in. Mirrors SDFConeShadow::SetSDF
+    // — called from the same residency-changed branch in Main.cpp. Pass nullptr
+    // to bind dummies (GI degrades to sky/escape only).
+    void SetSDFView(const ResidentSparseSDF* sparse, bool hasSDF);
 
     void Initialize(const VulkanContext& ctx, const GlobalSDF& sdf) override;
     void Terminate() override;
@@ -92,13 +92,19 @@ private:
     VkPipelineLayout      m_InsertLayout   = VK_NULL_HANDLE;
     VkPipeline            m_InsertPipeline = VK_NULL_HANDLE;
 
-    // ---- Relight pipeline ----
-    VkSampler             m_SdfSampler             = VK_NULL_HANDLE;
+    // ---- Relight pipeline (Phase 15e: sparse SDF) ----
     VkDescriptorSetLayout m_RelightSdfSetLayout    = VK_NULL_HANDLE; // set=0
     VkDescriptorPool      m_RelightSdfPool         = VK_NULL_HANDLE;
-    VkDescriptorSet       m_RelightSdfSet          = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, VulkanContext::kFramesInFlight> m_RelightSdfSets{};
     VkPipelineLayout      m_RelightLayout          = VK_NULL_HANDLE;
     VkPipeline            m_RelightPipeline        = VK_NULL_HANDLE;
+
+    // SparseParams UBO ring + dummy buffer for the no-SDF fallback.
+    std::array<VkBuffer,       VulkanContext::kFramesInFlight> m_SparseUboBuffers{};
+    std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> m_SparseUboMemory{};
+    std::array<void*,          VulkanContext::kFramesInFlight> m_SparseUboMapped{};
+    VkBuffer       m_DummySparseBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_DummySparseMemory = VK_NULL_HANDLE;
 
     // ---- Compose pipeline (post-lighting) ----
     VkDescriptorSetLayout m_ComposeGBufferSetLayout = VK_NULL_HANDLE;  // set=0
@@ -109,12 +115,28 @@ private:
     VkPipelineLayout      m_ComposeLayout   = VK_NULL_HANDLE;
     VkPipeline            m_ComposePipeline = VK_NULL_HANDLE;
 
-    // SDF residency snapshot, pushed via SetSDFView.
-    VkImageView m_SdfView   = VK_NULL_HANDLE;
-    glm::vec3   m_AabbMin   = glm::vec3(0.0f);
-    glm::vec3   m_AabbMax   = glm::vec3(1.0f);
-    float       m_MaxDist   = 1.0f;
-    bool        m_HasSDF    = false;
+    // Sparse SDF residency snapshot, pushed via SetSDFView.
+    bool         m_HasSDF       = false;
+    VkBuffer     m_IndexBuffer  = VK_NULL_HANDLE;
+    VkBuffer     m_PoolBuffer   = VK_NULL_HANDLE;
+    VkDeviceSize m_IndexBytes   = 0;
+    VkDeviceSize m_PoolBytes    = 0;
+    glm::vec3    m_AabbMin      = glm::vec3(0.0f);
+    glm::vec3    m_AabbMax      = glm::vec3(1.0f);
+    float        m_MaxDist      = 1.0f;
+    struct SparseParams {
+        glm::vec4  AABBMin;
+        glm::vec4  AABBMax;
+        glm::uvec4 Dims;
+    };
+    static_assert(sizeof(SparseParams) == 48, "RC SparseParams pinned 48 bytes");
+    SparseParams m_SparseParams{};
+
+    // Phase 14c: tracks which Readback slot was most recently submitted, so
+    // DrawImGuiParams reads from the slot whose copy has actually been GPU-
+    // completed by the time ImGui runs.
+    uint32_t    m_LastReadbackSlot = 0;
+    bool        m_HasReadback      = false;
 };
 
 } // namespace RS

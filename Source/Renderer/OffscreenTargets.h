@@ -4,10 +4,11 @@
 // can keep sampling last frame's GBuffer while we record into the next.
 //
 // Attachment list (mirrors FrameContext.h):
-//   * Albedo         RGBA8_UNORM
+//   * Albedo         RGBA8_UNORM   (rgb = albedo, a = AO)
 //   * Normal         A2B10G10R10_UNORM_PACK32 (encoded N*0.5+0.5)
-//   * RoughMetalF0   RGBA8_UNORM   (R=roughness, G=metallic, B=F0, A=unused)
+//   * RoughMetalF0   RGBA8_UNORM   (R=roughness, G=metallic, B=SpecularFactor, A=unused)
 //   * Emissive       RGBA16_SFLOAT
+//   * Specular       RGBA8_UNORM   (rgb = KHR specularColor (dielectric tint), a = unused)
 //   * Depth          D32_SFLOAT
 //   * Identity       R32G32_UINT   (instanceId, submeshId) — TRANSFER_SRC for picking
 //   * LightHDR       RGBA16_SFLOAT (Phase 10) — written by Shaders/lighting.comp
@@ -38,14 +39,15 @@ struct OffscreenFrame {
     OffscreenAttachment Normal;
     OffscreenAttachment RoughMetalF0;
     OffscreenAttachment Emissive;
+    OffscreenAttachment Specular;     // KHR_materials_specular: rgb = specularColor, a = unused.
     OffscreenAttachment Depth;
     OffscreenAttachment Identity;
     OffscreenAttachment LightHDR;     // Phase 10: lighting.comp writes here, Lit preview reads.
 };
 
 struct OffscreenTargets {
-    static constexpr uint32_t kColorAttachmentCount = 5;   // albedo, normal, rmf, emissive, identity
-    static constexpr uint32_t kAttachmentCount      = 6;   // + depth
+    static constexpr uint32_t kColorAttachmentCount = 6;   // albedo, normal, rmf, emissive, specular, identity
+    static constexpr uint32_t kAttachmentCount      = 7;   // + depth
 
     std::array<OffscreenFrame, VulkanContext::kFramesInFlight> Frames;
     VkExtent2D Extent      = { 0, 0 };
@@ -65,6 +67,7 @@ inline VkFormat OffscreenFormatAlbedo  () { return VK_FORMAT_R8G8B8A8_UNORM;    
 inline VkFormat OffscreenFormatNormal  () { return VK_FORMAT_A2B10G10R10_UNORM_PACK32;   }
 inline VkFormat OffscreenFormatRMF     () { return VK_FORMAT_R8G8B8A8_UNORM;             }
 inline VkFormat OffscreenFormatEmissive() { return VK_FORMAT_R16G16B16A16_SFLOAT;        }
+inline VkFormat OffscreenFormatSpecular() { return VK_FORMAT_R8G8B8A8_UNORM;             }
 inline VkFormat OffscreenFormatDepth   () { return VK_FORMAT_D32_SFLOAT;                 }
 inline VkFormat OffscreenFormatIdentity() { return VK_FORMAT_R32G32_UINT;                }
 inline VkFormat OffscreenFormatLightHDR() { return VK_FORMAT_R16G16B16A16_SFLOAT;        }

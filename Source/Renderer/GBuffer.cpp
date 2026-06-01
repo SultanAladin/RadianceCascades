@@ -21,9 +21,10 @@ namespace {
 struct GBufferPushConstants {
     glm::mat4 MVP;
     glm::mat4 Model;
-    glm::vec4 BaseColor;             // rgb = albedo, a = unused
-    glm::vec4 RoughMetalF0Emissive;  // r=roughness g=metallic b=F0 a=emissive scale
+    glm::vec4 BaseColor;             // rgb = albedo, a = AO
+    glm::vec4 RoughMetalSpecFactor;  // r=roughness g=metallic b=SpecularFactor a=emissive scale
     glm::vec4 EmissiveColor;         // rgb = emissive colour, a = unused
+    glm::vec4 SpecularColor;         // rgb = KHR specularColor (dielectric tint), a = unused
     glm::uvec4 IdentityIds;          // x = instanceId, y = submeshId
     glm::vec4 FloorParams;           // x = checker spacing (m), y = strength,
                                      // z = flag (>=0.5 → floor), w = dark tint scale
@@ -60,10 +61,10 @@ VkShaderModule LoadModule(VkDevice device, const char* path) {
 }
 
 bool CreateRenderPass(VkDevice device, VkRenderPass& outPass) {
-    // 5 colour + 1 depth. Each colour attachment clears to black at start, the
+    // 6 colour + 1 depth. Each colour attachment clears to black at start, the
     // depth attachment clears to 1.0. After the pass everything ends up in
     // SHADER_READ_ONLY_OPTIMAL so downstream samplers don't need barriers.
-    VkAttachmentDescription atts[6]{};
+    VkAttachmentDescription atts[7]{};
 
     auto initColor = [&](uint32_t i, VkFormat fmt) {
         atts[i].format         = fmt;
@@ -80,27 +81,28 @@ bool CreateRenderPass(VkDevice device, VkRenderPass& outPass) {
     initColor(1, OffscreenFormatNormal  ());
     initColor(2, OffscreenFormatRMF     ());
     initColor(3, OffscreenFormatEmissive());
-    initColor(4, OffscreenFormatIdentity());
+    initColor(4, OffscreenFormatSpecular());
+    initColor(5, OffscreenFormatIdentity());
 
-    atts[5].format         = OffscreenFormatDepth();
-    atts[5].samples        = VK_SAMPLE_COUNT_1_BIT;
-    atts[5].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    atts[5].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;   // sampled by preview's depth view
-    atts[5].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    atts[5].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[5].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[5].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    atts[6].format         = OffscreenFormatDepth();
+    atts[6].samples        = VK_SAMPLE_COUNT_1_BIT;
+    atts[6].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[6].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;   // sampled by preview's depth view
+    atts[6].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[6].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[6].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[6].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkAttachmentReference colorRefs[5]{};
-    for (uint32_t i = 0; i < 5; ++i) {
+    VkAttachmentReference colorRefs[6]{};
+    for (uint32_t i = 0; i < 6; ++i) {
         colorRefs[i].attachment = i;
         colorRefs[i].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
-    VkAttachmentReference depthRef{ 5, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference depthRef{ 6, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount    = 5;
+    subpass.colorAttachmentCount    = 6;
     subpass.pColorAttachments       = colorRefs;
     subpass.pDepthStencilAttachment = &depthRef;
 
@@ -124,7 +126,7 @@ bool CreateRenderPass(VkDevice device, VkRenderPass& outPass) {
     deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
     VkRenderPassCreateInfo rpci{ VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-    rpci.attachmentCount = 6;
+    rpci.attachmentCount = 7;
     rpci.pAttachments    = atts;
     rpci.subpassCount    = 1;
     rpci.pSubpasses      = &subpass;
@@ -199,14 +201,14 @@ bool CreatePipeline(VkDevice device, VkRenderPass pass, VkExtent2D extent,
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp   = VK_COMPARE_OP_LESS;
 
-    VkPipelineColorBlendAttachmentState atts[5]{};
-    for (uint32_t i = 0; i < 5; ++i) {
+    VkPipelineColorBlendAttachmentState atts[6]{};
+    for (uint32_t i = 0; i < 6; ++i) {
         atts[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
         atts[i].blendEnable    = VK_FALSE;
     }
     VkPipelineColorBlendStateCreateInfo cb{ VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
-    cb.attachmentCount = 5;
+    cb.attachmentCount = 6;
     cb.pAttachments    = atts;
 
     VkPushConstantRange pcRange{};
@@ -249,17 +251,18 @@ bool CreateFramebuffers(VkDevice device, VkRenderPass pass,
                         std::array<VkFramebuffer, VulkanContext::kFramesInFlight>& outFbs) {
     for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
         const OffscreenFrame& f = targets.Frames[i];
-        VkImageView att[6] = {
+        VkImageView att[7] = {
             f.Albedo.View,
             f.Normal.View,
             f.RoughMetalF0.View,
             f.Emissive.View,
+            f.Specular.View,
             f.Identity.View,
             f.Depth.View,
         };
         VkFramebufferCreateInfo fbci{ VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
         fbci.renderPass      = pass;
-        fbci.attachmentCount = 6;
+        fbci.attachmentCount = 7;
         fbci.pAttachments    = att;
         fbci.width           = targets.Extent.width;
         fbci.height          = targets.Extent.height;
@@ -315,11 +318,13 @@ void GBufferPassTerminate(GBufferPass& gp, const VulkanContext& ctx) {
 
 GBufferMaterial GBufferMaterialFromPbr(const PbrMaterial& m) {
     GBufferMaterial g{};
-    g.BaseColor = m.AlbedoFlat;
-    g.Roughness = m.RoughnessFlat;
-    g.Metallic  = m.MetallicFlat;
-    g.F0        = m.F0Flat.x;            // v1 single-channel F0
-    g.Emissive  = m.EmissiveFlat;
+    g.BaseColor  = m.AlbedoFlat;
+    g.AO         = m.AOFlat;
+    g.Roughness  = m.RoughnessFlat;
+    g.Metallic   = m.MetallicFlat;
+    g.SpecFactor = m.SpecularFactorFlat;
+    g.SpecColor  = m.F0Flat;             // KHR specularColor — RGB dielectric tint
+    g.Emissive   = m.EmissiveFlat;
     return g;
 }
 
@@ -331,16 +336,16 @@ void GBufferPassRecord(GBufferPass& gp, const VulkanContext& ctx,
                        MaterialRegistry& materials,
                        const GBufferMaterial& fallback,
                        const GBufferFloorConfig& floor) {
-    VkClearValue clears[6]{};
-    // Albedo / normal / RMF / emissive / identity all clear to 0.
-    clears[5].depthStencil = { 1.0f, 0 };
+    VkClearValue clears[7]{};
+    // Albedo / normal / RMF / emissive / specular / identity all clear to 0.
+    clears[6].depthStencil = { 1.0f, 0 };
 
     VkRenderPassBeginInfo rpbi{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rpbi.renderPass        = gp.RenderPass;
     rpbi.framebuffer       = gp.Framebuffers[frameSlot];
     rpbi.renderArea.offset = { 0, 0 };
     rpbi.renderArea.extent = ctx.SwapchainExtent;
-    rpbi.clearValueCount   = 6;
+    rpbi.clearValueCount   = 7;
     rpbi.pClearValues      = clears;
     vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -374,10 +379,11 @@ void GBufferPassRecord(GBufferPass& gp, const VulkanContext& ctx,
             GBufferPushConstants pc{};
             pc.Model                = inst.Transform;
             pc.MVP                  = viewProj * inst.Transform;
-            pc.BaseColor            = glm::vec4(gm.BaseColor, 1.0f);
-            pc.RoughMetalF0Emissive = glm::vec4(gm.Roughness, gm.Metallic,
-                                                gm.F0, 1.0f);
+            pc.BaseColor            = glm::vec4(gm.BaseColor, gm.AO);
+            pc.RoughMetalSpecFactor = glm::vec4(gm.Roughness, gm.Metallic,
+                                                gm.SpecFactor, 1.0f);
             pc.EmissiveColor        = glm::vec4(gm.Emissive, 0.0f);
+            pc.SpecularColor        = glm::vec4(gm.SpecColor, 0.0f);
             pc.IdentityIds          = glm::uvec4(static_cast<uint32_t>(handle), s, 0u, 0u);
 
             const bool isFloor = (floor.FloorInstance != 0 &&

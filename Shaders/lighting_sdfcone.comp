@@ -3,19 +3,36 @@
 // Phase 13 lighting compose — SDFCone variant. Same Karis/Schlick/Smith path as
 // lighting.comp, but the shadow factor comes from a sphere-traced soft shadow
 // against the resident mesh SDF. The trace primitive lives in
-// `include/sdf_trace.glsl` so Phase 14b's rc_relight.comp shares it.
+// `include/sdf_trace.glsl` so rc_relight.comp shares it.
 //
-// Descriptor contract (set=2 for variant 3):
-//   binding 0 = sampler3D R16_SNORM (resident mesh SDF — dummy 1^3 fallback)
-//   binding 1 = AlgoUbo (80 bytes — sun, AABB, decode scale, trace params)
-//   binding 2 = InstanceXform SSBO (mat4 InverseModel[256]) — Phase 13.5.
-//               Without this the shader can't transform world-space pixels
-//               into the SDF's mesh-local frame, and shadows go bananas
-//               (every pixel samples the bottom voxel slab of the SDF and
-//               picks up a phantom stand occluder permanently on the top
-//               half of each ball).
+// Phase 15d: sparse SDF — the sampler3D bind point is replaced by a sparse-VDB
+// pair (BrickIndex SSBO + BrickPool SSBO) plus a SparseParams UBO. The sphere
+// trace uses the brick-aware ray helper, so empty bricks skip in one step.
+//
+// Descriptor contract (set=2, variant 3):
+//   binding 0 = SparseIdx  SSBO   (uint BrickIndex[BrickGrid^3])
+//   binding 1 = SparsePool SSBO   (uint BrickPool[Occupied*BrickSize^3/2])
+//   binding 2 = SparseParams UBO  (SparseSDFParams: AABB + dims + maxDist + decode)
+//   binding 3 = AlgoUbo           (48 B — sun, trace params, surface offset, flags)
+//   binding 4 = InstanceXform SSBO (mat4 InverseModel[256]) — Phase 13.5.
+//               Per-instance inverse-model loop maps world pixels into MESH-LOCAL
+//               coordinates before tracing. The sparse params (AABB, brick grid)
+//               live in mesh-local space, same as the dense bake did.
+
+#include "include/sdf_sparse.glsl"
+
+// Sparse storage bindings — declared FIRST so the macros below can name them.
+layout(std430, set = 2, binding = 0) readonly buffer SparseIdx  { uint Data[]; } uSparseIdx;
+layout(std430, set = 2, binding = 1) readonly buffer SparsePool { uint Data[]; } uSparsePool;
+layout(std140, set = 2, binding = 2) uniform SparseParamsBuf { SparseSDFParams P; } uSparseP;
+
+SDFSPARSE_DEFINE_HELPER    (uSparseIdx, uSparsePool)
+SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)
 
 #include "include/sdf_trace.glsl"
+#include "include/pbr_brdf.glsl"
+
+SDFTRACE_DEFINE_SPARSE_HELPERS()
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -30,18 +47,18 @@ layout(set = 1, binding = 6) uniform samplerCube  uIrradiance;
 layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
 layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
 layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
+layout(set = 1, binding = 10) uniform sampler2D   uSpecular;
 
 // ----------------------- set=2 SDFCone shadow contract -----------------------
-layout(set = 2, binding = 0) uniform sampler3D uMeshSDF;
-layout(set = 2, binding = 1) uniform AlgoUbo {
+// SDF storage at bindings 0/1/2 declared above. AlgoUbo + xforms below.
+
+layout(set = 2, binding = 3) uniform AlgoUbo {
     vec4 SunDirAndHalfAngle;     // xyz = direction TOWARD sun, w = half-angle (rad)
-    vec4 AABBMinAndMaxDist;      // xyz = AABB min,  w = R16_SNORM decode scale
-    vec4 AABBMaxAndSurfaceOff;   // xyz = AABB max,  w = surface offset along N
-    vec4 TraceParams;            // x = maxSteps, y = maxDistance, z = minStep, w = strength
-    vec4 Flags;                  // x = enabled, y = hasSDF
+    vec4 TraceParamsAndSurfOff;  // x = maxSteps, y = maxDistance, z = minStep, w = surfaceOffset
+    vec4 StrengthAndFlags;       // x = strength, y = enabled, z = hasSDF, w = 0
 } ualgo;
 
-layout(set = 2, binding = 2, std430) readonly buffer InstanceXforms {
+layout(std430, set = 2, binding = 4) readonly buffer InstanceXforms {
     uint sdfInstanceCount;
     uint pad0, pad1, pad2;
     mat4 sdfInvModels[256];
@@ -56,33 +73,6 @@ layout(push_constant) uniform Push {
     vec4 IblParams;              // x = on/off, y = intensity, z = prefilter mip count
     vec4 ResAndFlags;            // x = width, y = height
 } pc;
-
-// ----------------------- BRDF helpers ----------------------------------------
-
-const float kPI = 3.14159265359;
-
-float D_GGX(float NdotH, float roughness) {
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float d = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
-    return a2 / (kPI * d * d + 1e-5);
-}
-
-float V_SmithGGXCorrelated(float NdotV, float NdotL, float roughness) {
-    float a = roughness * roughness;
-    float ggxV = NdotL * sqrt(NdotV * NdotV * (1.0 - a) + a);
-    float ggxL = NdotV * sqrt(NdotL * NdotL * (1.0 - a) + a);
-    return 0.5 / max(ggxV + ggxL, 1e-5);
-}
-
-vec3 F_Schlick(float VdotH, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-}
-
-vec3 F_SchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-    vec3 Fr = max(vec3(1.0 - roughness), F0) - F0;
-    return F0 + Fr * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
 
 // ----------------------- main ------------------------------------------------
 
@@ -99,15 +89,18 @@ void main() {
         return;
     }
 
-    vec3  albedo  = texture(uAlbedo,   uv).rgb;
-    vec3  encN    = texture(uNormal,   uv).rgb;
-    vec3  rmf     = texture(uRMF,      uv).rgb;
-    vec3  emiss   = texture(uEmissive, uv).rgb;
+    vec4 albedoAO = texture(uAlbedo,   uv);
+    vec3 albedo   = albedoAO.rgb;
+    float ao      = albedoAO.a;
+    vec3 encN     = texture(uNormal,   uv).rgb;
+    vec3 rmf      = texture(uRMF,      uv).rgb;
+    vec3 emiss    = texture(uEmissive, uv).rgb;
+    vec3 specCol  = texture(uSpecular, uv).rgb;
 
     vec3  N         = normalize(encN * 2.0 - 1.0);
     float roughness = max(rmf.r, 0.04);
     float metallic  = rmf.g;
-    float F0Scalar  = rmf.b;
+    float specFact  = rmf.b;
 
     vec4 ndc       = vec4(uv * 2.0 - 1.0, depth, 1.0);
     vec4 worldH    = pc.InvViewProj * ndc;
@@ -120,73 +113,72 @@ void main() {
     float NdotV = max(dot(N, V), 1e-3);
     float NdotH = max(dot(N, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
+    float LdotV = dot(L, V);
 
-    vec3 F0 = mix(vec3(F0Scalar), albedo, metallic);
+    vec3 F0 = ComputeF0_KHR(albedo, metallic, specCol, specFact);
+
+    uint flags     = UnpackPbrFlags(pc.IblParams.w);
+    bool realistic = IsRealisticPbr(flags);
+
     float D  = D_GGX(NdotH, roughness);
     float Vt = V_SmithGGXCorrelated(NdotV, NdotL, roughness);
     vec3  F  = F_Schlick(VdotH, F0);
     vec3 specular = D * Vt * F;
     vec3 kS       = F;
-    vec3 kD       = (1.0 - kS) * (1.0 - metallic);
-    vec3 diffuse  = kD * albedo / kPI;
+    vec3 kD       = (vec3(1.0) - kS) * (1.0 - metallic);
+    vec3 diffuse  = realistic
+        ? kD * Diffuse_EON(albedo, NdotV, NdotL, LdotV, roughness)
+        : kD * albedo * kInvPI;
 
-    // Shadow factor via SDF cone trace, transformed into the receiver's
-    // mesh-local space. The SDF + its AABB live in mesh-local coords
-    // (whatever units the OBJ vertices were in — ShaderBall is cm). The
-    // pixel's world position and the sun direction are in world meters.
-    // Without the per-instance map below, every pixel gets a constant shadow
-    // ghost from the bottom voxel slice of the SDF.
+    vec2 brdfLut = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
+    vec3 ecomp   = realistic ? EnergyCompFactor(F0, brdfLut) : vec3(1.0);
+
+    // Shadow factor via sparse SDF sphere trace in mesh-local space (Phase 15d).
+    // The SparseSDFParams AABB + brick grid live in mesh-local coords (the bake
+    // was authored in OBJ-local space — cm for ShaderBall). Pixels are in world
+    // meters; per-instance invModel transforms ro/rd into mesh-local before
+    // tracing. We compute a single scaleLocalPerWorld factor per instance to
+    // remap world-unit tunables (maxDistance, minStep, surface offset) onto the
+    // local trace.
     float shadow = 1.0;
-    bool tracingOn = (ualgo.Flags.x > 0.5) && (ualgo.Flags.y > 0.5) && NdotL > 0.0;
+    bool tracingOn = (ualgo.StrengthAndFlags.y > 0.5) &&
+                     (ualgo.StrengthAndFlags.z > 0.5) && NdotL > 0.0;
     if (tracingOn) {
-        // Step off the surface along N (in world space) before mapping in.
-        // We add a light-direction bias and slope scale to prevent shadow acne
-        // (jittering spots) where the ray starts inside an interpolated voxel.
+        float surfaceOff = ualgo.TraceParamsAndSurfOff.w;
         float slopeScale = 1.0 + max(0.0, 1.0 - NdotL) * 2.0;
-        vec3 roWorld = worldPos + N * (ualgo.AABBMaxAndSurfaceOff.w * slopeScale) + L * (ualgo.AABBMaxAndSurfaceOff.w * 0.5);
-        
+        vec3 roWorld = worldPos + N * (surfaceOff * slopeScale) + L * (surfaceOff * 0.5);
+
         float minVis = 1.0;
         uint count = min(uXforms.sdfInstanceCount, 256u);
         for (uint i = 0; i < count; ++i) {
             mat4 invModel = uXforms.sdfInvModels[i];
             vec3 roLocal = (invModel * vec4(roWorld, 1.0)).xyz;
 
-            // Direction transforms by mat3(invModel). For uniform-scale + trans
-            // this is correct; re-normalise to drop the scale factor that ends
-            // up in the vector length.
             vec3 rdLocalRaw = mat3(invModel) * L;
-            float scaleLocalPerWorld = length(rdLocalRaw); // e.g. 100 for cm→m
+            float scaleLocalPerWorld = length(rdLocalRaw); // e.g. 100 for cm->m
             vec3  rdLocal = rdLocalRaw / max(scaleLocalPerWorld, 1e-6);
 
-            // maxDistance and minStep are world-space tunables; map to local.
-            float maxDistLocal = ualgo.TraceParams.y * scaleLocalPerWorld;
-            float minStepLocal = max(ualgo.TraceParams.z * scaleLocalPerWorld, 1e-4);
+            float maxDistLocal = ualgo.TraceParamsAndSurfOff.y * scaleLocalPerWorld;
+            float minStepLocal = max(ualgo.TraceParamsAndSurfOff.z * scaleLocalPerWorld, 1e-4);
 
-            // Penumbra coefficient k = 1/tan(half_angle). Larger = sharper shadow.
-            // Half-angle 1.5° (default) → k ≈ 38. Matches the prototype's k=24
-            // (≈ 2.4° half-angle) form in rc3d_render.py::soft_shadow.
             float k = 1.0 / max(tan(ualgo.SunDirAndHalfAngle.w), 1e-4);
-            int   maxSteps = int(clamp(ualgo.TraceParams.x, 1.0, 256.0));
+            int   maxSteps = int(clamp(ualgo.TraceParamsAndSurfOff.x, 1.0, 256.0));
 
-            float vis = SDF_SoftShadow(uMeshSDF, roLocal, rdLocal,
-                                       maxDistLocal,
-                                       k,
-                                       maxSteps,
-                                       minStepLocal,
-                                       ualgo.AABBMinAndMaxDist.xyz,
-                                       ualgo.AABBMaxAndSurfaceOff.xyz,
-                                       ualgo.AABBMinAndMaxDist.w);
+            float vis = SDF_SoftShadowSparse(roLocal, rdLocal,
+                                             maxDistLocal,
+                                             k,
+                                             maxSteps,
+                                             minStepLocal,
+                                             uSparseP.P);
             minVis = min(minVis, vis);
             if (minVis <= 0.01) break;
         }
 
-        // Strength blends the trace result with full-lit (1.0). Strength=1 →
-        // pure trace, Strength=0 → no shadow.
-        shadow = mix(1.0, minVis, clamp(ualgo.TraceParams.w, 0.0, 1.0));
+        shadow = mix(1.0, minVis, clamp(ualgo.StrengthAndFlags.x, 0.0, 1.0));
     }
 
     vec3 sunRadiance = pc.SunColor.rgb * pc.SunDirAndIntensity.w;
-    vec3 lit = (diffuse + specular) * sunRadiance * NdotL * shadow;
+    vec3 lit = (diffuse + specular * ecomp) * sunRadiance * NdotL * shadow;
 
     // IBL split-sum.
     vec3 ambient;
@@ -197,12 +189,15 @@ void main() {
         vec3  kD_ibl    = (vec3(1.0) - Fr) * (1.0 - metallic);
         float mipCount  = max(pc.IblParams.z - 1.0, 0.0);
         vec3  prefilt   = textureLod(uPrefilter, R, roughness * mipCount).rgb;
-        vec2  brdf      = texture(uBrdfLut, vec2(NdotV, roughness)).rg;
-        vec3  specIBL   = prefilt * (Fr * brdf.x + brdf.y);
-        ambient = (kD_ibl * irr * albedo + specIBL) * pc.IblParams.y;
+        vec3  specIBL   = prefilt * (Fr * brdfLut.x + brdfLut.y) * ecomp;
+        vec3  diffIBL = realistic
+            ? kD_ibl * irr * Diffuse_EON(albedo, NdotV, 1.0, 1.0, roughness) * kPI
+            : kD_ibl * irr * albedo;
+        ambient = (diffIBL + specIBL) * pc.IblParams.y;
     } else {
         ambient = albedo * pc.EyePosWorld.w;
     }
+    ambient *= ao;
 
     vec3 result = lit + ambient + emiss;
     imageStore(uLightHDR, px, vec4(result, 1.0));

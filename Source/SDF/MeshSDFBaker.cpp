@@ -137,6 +137,7 @@ private:
         return d2;
     }
 
+
 public:
     // Eberly closest-point on triangle (regions 0-6).
     static glm::vec3 ClosestPointOnTriangle(const glm::vec3& p,
@@ -257,36 +258,24 @@ bool ReadMeshCpuData(const VulkanContext& ctx, const GpuMesh& mesh,
     return true;
 }
 
-} // namespace
+// ---- shared bake helpers (Phase 15a refactor) ------------------------------
 
-BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
-                          const GpuMesh&       mesh,
-                          uint32_t             resolution,
-                          BakeProgress*        progress,
-                          int                  algorithmChoice) {
-    const auto bakeStart = std::chrono::steady_clock::now();
-    BakedSDF result{};
-    if (resolution == 0 || resolution > 256) {
-        RS_LOG_ERROR("MeshSDFBaker: invalid resolution %u", resolution);
-        return result;
-    }
-    if (mesh.IndexCount < 3) {
-        RS_LOG_ERROR("MeshSDFBaker: mesh has no triangles");
-        return result;
-    }
+struct SdfBounds {
+    glm::vec3 AABBMin;
+    glm::vec3 AABBMax;
+    glm::vec3 VoxelSize;
+    float     MaxDist;
+};
 
-    // 1. Pull vertex / index data from host-visible memory.
-    std::vector<ParsedVertex> verts;
-    std::vector<uint32_t>     indices;
-    if (!ReadMeshCpuData(ctx, mesh, verts, indices)) {
-        RS_LOG_ERROR("MeshSDFBaker: failed to read mesh CPU data");
-        return result;
-    }
-
-    // 2. Build triangle records.
+// Build per-triangle records from a parsed vertex + index stream. Drops
+// degenerate (zero-area) triangles. Returns true if at least one triangle made
+// it through.
+bool BuildTris(const std::vector<ParsedVertex>& verts,
+               const std::vector<uint32_t>&     indices,
+               std::vector<Tri>&                outTris) {
     const size_t triCount = indices.size() / 3;
-    std::vector<Tri> tris;
-    tris.reserve(triCount);
+    outTris.clear();
+    outTris.reserve(triCount);
     for (size_t t = 0; t < triCount; ++t) {
         const uint32_t i0 = indices[t * 3 + 0];
         const uint32_t i1 = indices[t * 3 + 1];
@@ -306,40 +295,91 @@ BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
         tri.Centroid = (tri.V0 + tri.V1 + tri.V2) * (1.0f / 3.0f);
         tri.AABBMin  = glm::min(glm::min(tri.V0, tri.V1), tri.V2);
         tri.AABBMax  = glm::max(glm::max(tri.V0, tri.V1), tri.V2);
-        tris.push_back(tri);
+        outTris.push_back(tri);
     }
-    if (tris.empty()) {
-        RS_LOG_ERROR("MeshSDFBaker: all triangles degenerate");
-        return result;
-    }
+    return !outTris.empty();
+}
 
-    // 3. BVH.
-    TriBVH bvh;
-    if (!bvh.Build(tris)) {
-        RS_LOG_ERROR("MeshSDFBaker: BVH build failed");
-        return result;
-    }
-    if (progress) {
-        progress->TriangleCount.store(static_cast<uint32_t>(tris.size()),
-                                      std::memory_order_relaxed);
-    }
-
-    // 4. Pad the mesh AABB by 5% so the SDF AABB has gradient slack outside the
-    //    surface. Centred padding so the sphere-trace start positions outside
-    //    the mesh have a meaningful positive distance.
+// Pad the mesh AABB by 5% so the SDF has gradient slack outside the surface;
+// pick MaxDist = 1.5 × box diagonal so even the far corner sits unsaturated in
+// the R16_SNORM band.
+SdfBounds ComputeSdfBounds(const GpuMesh& mesh, uint32_t resolution) {
+    SdfBounds b{};
     const glm::vec3 aabbCenter = 0.5f * (mesh.AABBMin + mesh.AABBMax);
     const glm::vec3 aabbHalf   = 0.5f * (mesh.AABBMax - mesh.AABBMin);
     const glm::vec3 padHalf    = aabbHalf * 1.05f + glm::vec3(1e-3f);
-    result.AABBMin    = aabbCenter - padHalf;
-    result.AABBMax    = aabbCenter + padHalf;
-    result.Resolution = resolution;
+    b.AABBMin   = aabbCenter - padHalf;
+    b.AABBMax   = aabbCenter + padHalf;
+    const glm::vec3 boxSize = b.AABBMax - b.AABBMin;
+    b.VoxelSize = boxSize / static_cast<float>(resolution);
+    b.MaxDist   = 1.5f * glm::length(boxSize);
+    return b;
+}
 
-    const glm::vec3 boxSize = result.AABBMax - result.AABBMin;
-    const glm::vec3 voxelSize = boxSize / static_cast<float>(resolution);
-    // Encode scale: distances clamped to [-MaxDist, +MaxDist] then mapped to
-    // [-32767, 32767]. Pick MaxDist = 1.5 × box diagonal so even the far corner
-    // of the SDF box has unsaturated values.
-    result.MaxDist = 1.5f * glm::length(boxSize);
+// Pulls mesh CPU data, builds tris, builds BVH, computes bounds. Publishes the
+// triangle count via `progress` once the BVH is ready (matches the dense
+// path's existing point of publication so progress observers behave the same).
+// Returns false on read failure / empty mesh / BVH build failure.
+bool PrepareBake(const VulkanContext& ctx,
+                 const GpuMesh&       mesh,
+                 uint32_t             resolution,
+                 BakeProgress*        progress,
+                 std::vector<Tri>&    outTris,
+                 TriBVH&              outBvh,
+                 SdfBounds&           outBounds) {
+    if (mesh.IndexCount < 3) {
+        RS_LOG_ERROR("MeshSDFBaker: mesh has no triangles");
+        return false;
+    }
+    std::vector<ParsedVertex> verts;
+    std::vector<uint32_t>     indices;
+    if (!ReadMeshCpuData(ctx, mesh, verts, indices)) {
+        RS_LOG_ERROR("MeshSDFBaker: failed to read mesh CPU data");
+        return false;
+    }
+    if (!BuildTris(verts, indices, outTris)) {
+        RS_LOG_ERROR("MeshSDFBaker: all triangles degenerate");
+        return false;
+    }
+    if (!outBvh.Build(outTris)) {
+        RS_LOG_ERROR("MeshSDFBaker: BVH build failed");
+        return false;
+    }
+    if (progress) {
+        progress->TriangleCount.store(static_cast<uint32_t>(outTris.size()),
+                                      std::memory_order_relaxed);
+    }
+    outBounds = ComputeSdfBounds(mesh, resolution);
+    return true;
+}
+
+} // namespace
+
+BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
+                          const GpuMesh&       mesh,
+                          uint32_t             resolution,
+                          BakeProgress*        progress,
+                          int                  algorithmChoice) {
+    const auto bakeStart = std::chrono::steady_clock::now();
+    BakedSDF result{};
+    if (resolution == 0 || resolution > 256) {
+        RS_LOG_ERROR("MeshSDFBaker: invalid resolution %u", resolution);
+        return result;
+    }
+
+    // 1-4. Shared prep: mesh CPU read + tri build + BVH + bounds.
+    std::vector<Tri> tris;
+    TriBVH bvh;
+    SdfBounds bounds{};
+    if (!PrepareBake(ctx, mesh, resolution, progress, tris, bvh, bounds)) {
+        return result;
+    }
+
+    result.AABBMin    = bounds.AABBMin;
+    result.AABBMax    = bounds.AABBMax;
+    result.Resolution = resolution;
+    result.MaxDist    = bounds.MaxDist;
+    const glm::vec3 voxelSize = bounds.VoxelSize;
 
     const size_t voxelCount = static_cast<size_t>(resolution) *
                               static_cast<size_t>(resolution) *
@@ -527,6 +567,241 @@ BakedSDF MeshSDFBakerBake(const VulkanContext& ctx,
     if (progress) progress->DurationMs.store(durationMs, std::memory_order_relaxed);
     RS_LOG_INFO("MeshSDFBaker: baked %u^3 SDF over %zu triangles (maxDist=%.3f, %.1f ms)",
                 resolution, tris.size(), result.MaxDist, durationMs);
+    return result;
+}
+
+// ---- Phase 15a: brick-native sparse baker ----------------------------------
+// Produces BakedSparseSDF directly. Peak RAM scales with occupiedBricks ×
+// brickSize^3, not res^3. Matches what SDFCacheBuildSparse(dense, brickSize)
+// would produce on a finished dense bake (same classify threshold, same sign
+// rule, same trailing-brick clamp).
+BakedSparseSDF MeshSDFBakerBakeSparse(const VulkanContext& ctx,
+                                      const GpuMesh&       mesh,
+                                      uint32_t             resolution,
+                                      uint32_t             brickSize,
+                                      BakeProgress*        progress,
+                                      int                  algorithmChoice) {
+    const auto bakeStart = std::chrono::steady_clock::now();
+    BakedSparseSDF result{};
+    if (resolution == 0 || resolution > 1024) {
+        RS_LOG_ERROR("MeshSDFBakerSparse: invalid resolution %u", resolution);
+        return result;
+    }
+    if (brickSize != 4u && brickSize != 8u && brickSize != 16u) {
+        RS_LOG_ERROR("MeshSDFBakerSparse: invalid brickSize %u (must be 4/8/16)", brickSize);
+        return result;
+    }
+    if (algorithmChoice != 0) {
+        RS_LOG_WARN("MeshSDFBakerSparse: algorithmChoice=%d not implemented (FSM is Phase 15b); falling back to BVH",
+                    algorithmChoice);
+    }
+
+    std::vector<Tri> tris;
+    TriBVH bvh;
+    SdfBounds bounds{};
+    if (!PrepareBake(ctx, mesh, resolution, progress, tris, bvh, bounds)) {
+        return result;
+    }
+
+    result.AABBMin    = bounds.AABBMin;
+    result.AABBMax    = bounds.AABBMax;
+    result.Resolution = resolution;
+    result.MaxDist    = bounds.MaxDist;
+    result.BrickSize  = brickSize;
+    result.BrickGrid  = (resolution + brickSize - 1u) / brickSize;
+
+    const uint32_t bg      = result.BrickGrid;
+    const uint32_t bs      = brickSize;
+    const uint32_t bsCubed = bs * bs * bs;
+    const size_t   indexCount = static_cast<size_t>(bg) * bg * bg;
+    result.BrickIndex.assign(indexCount, kSparseBrickIndexAllOutside);
+
+    // Same one-SNORM-step classify threshold as SDFCacheBuildSparse → identical
+    // mixed/sentinel partition. A brick is one-sided iff every voxel-centre has
+    // |d| > threshold. Use the BVH's exact closest-point query at the brick
+    // centre + the triangle-inequality bound:
+    //
+    //   for any voxel-centre v in the brick: dist(v, mesh) ≥ centreDist − halfDiag
+    //
+    // where halfDiag = half the brick's voxel-centre diagonal. So we can
+    // classify the brick as one-sided when:
+    //
+    //   centreDist > threshold + halfDiag
+    //
+    // (AABB-vs-tri-AABB at BVH leaves is too loose — long thin tris have AABBs
+    // that intersect distant bricks, collapsing the bound to ~0 and forcing
+    // every brick into the mixed bucket.)
+    const float threshold = (1.0f / 32767.0f) * result.MaxDist;
+
+    const glm::vec3 voxelSize = bounds.VoxelSize;
+    const glm::vec3 origin    = bounds.AABBMin + 0.5f * voxelSize;
+
+    // Per-worker accumulation. Each worker collects mixed bricks into a local
+    // pool + a map of (flatBrickIdx → localOffsetInBricks). Sentinels are
+    // written directly into the shared BrickIndex (distinct slots, race-free).
+    struct WorkerOut {
+        std::vector<int16_t>                       LocalPool;       // contiguous bs^3 chunks
+        std::vector<std::pair<uint32_t, uint32_t>> LocalMap;        // (flatBrickIdx, localChunkIndex)
+    };
+
+    const unsigned hwc = std::thread::hardware_concurrency();
+    const unsigned workerCount = hwc == 0 ? 4u : std::min(hwc, 16u);
+    std::vector<WorkerOut> workerOut(workerCount);
+
+    std::atomic<uint32_t> nextBrick { 0 };
+    std::atomic<uint32_t> doneBricks { 0 };
+    const uint32_t totalBricks = static_cast<uint32_t>(indexCount);
+
+    auto worker = [&](unsigned widx) {
+        WorkerOut& wo = workerOut[widx];
+        while (true) {
+            if (progress && progress->Cancel.load(std::memory_order_relaxed)) return;
+            const uint32_t bi = nextBrick.fetch_add(1, std::memory_order_relaxed);
+            if (bi >= totalBricks) return;
+
+            // Unpack brick coord. BrickIndex layout = (bz * bg + by) * bg + bx.
+            const uint32_t bx = bi % bg;
+            const uint32_t by = (bi / bg) % bg;
+            const uint32_t bz = bi / (bg * bg);
+
+            // Voxel range in dense grid (inclusive lo, exclusive hi). Trailing
+            // brick may straddle the resolution edge.
+            const uint32_t x0 = bx * bs, x1 = std::min(x0 + bs, resolution);
+            const uint32_t y0 = by * bs, y1 = std::min(y0 + bs, resolution);
+            const uint32_t z0 = bz * bs, z1 = std::min(z0 + bs, resolution);
+
+            // Voxel-centre extents inside the brick. Use the full bs span (not
+            // the clamped x1/y1/z1) so the classify gate stays consistent
+            // across every brick; the inner loop handles the clamp for partial
+            // trailing bricks via the (sx,sy,sz) coordinate clamp below.
+            const glm::vec3 brickMin = origin + glm::vec3(
+                voxelSize.x * static_cast<float>(x0),
+                voxelSize.y * static_cast<float>(y0),
+                voxelSize.z * static_cast<float>(z0));
+            const glm::vec3 brickMax = origin + glm::vec3(
+                voxelSize.x * static_cast<float>(x0 + bs - 1u),
+                voxelSize.y * static_cast<float>(y0 + bs - 1u),
+                voxelSize.z * static_cast<float>(z0 + bs - 1u));
+            const glm::vec3 centre   = 0.5f * (brickMin + brickMax);
+            const float     halfDiag = 0.5f * glm::length(brickMax - brickMin);
+
+            // One BVH query at the brick centre serves both classify and sign.
+            float centreDsq; glm::vec3 centreCp; int centreTri;
+            bvh.ClosestPoint(centre, centreDsq, centreCp, centreTri);
+            const float centreDist = std::sqrt(centreDsq);
+
+            // Sign at brick centre (same rule as the per-voxel inner loop).
+            bool centreInside = false;
+            if (centreTri >= 0) {
+                const glm::vec3& n = bvh.GetTri(centreTri).Normal;
+                if (glm::dot(centre - centreCp, n) < 0.0f) centreInside = true;
+            }
+
+            if (centreDist > threshold + halfDiag) {
+                // Triangle inequality guarantees every voxel-centre in the
+                // brick saturates: dist(v) ≥ centreDist − halfDiag > threshold.
+                result.BrickIndex[bi] = centreInside ? kSparseBrickIndexAllInside
+                                                     : kSparseBrickIndexAllOutside;
+            } else {
+                // Mixed — allocate a chunk in this worker's local pool.
+                const uint32_t localChunk = static_cast<uint32_t>(wo.LocalMap.size());
+                wo.LocalMap.emplace_back(bi, localChunk);
+                const size_t poolBase = wo.LocalPool.size();
+                wo.LocalPool.resize(poolBase + bsCubed);
+
+                for (uint32_t lz = 0; lz < bs; ++lz) {
+                for (uint32_t ly = 0; ly < bs; ++ly) {
+                for (uint32_t lx = 0; lx < bs; ++lx) {
+                    // Sample coord with trailing-brick clamp (matches
+                    // SDFCacheBuildSparse lines 239-241): voxels past the
+                    // dense resolution edge clamp to the last in-range coord.
+                    const uint32_t sx = std::min(x0 + lx, resolution - 1u);
+                    const uint32_t sy = std::min(y0 + ly, resolution - 1u);
+                    const uint32_t sz = std::min(z0 + lz, resolution - 1u);
+                    const glm::vec3 p = origin + glm::vec3(
+                        voxelSize.x * static_cast<float>(sx),
+                        voxelSize.y * static_cast<float>(sy),
+                        voxelSize.z * static_cast<float>(sz));
+
+                    float dsq; glm::vec3 cp; int triIdx;
+                    bvh.ClosestPoint(p, dsq, cp, triIdx);
+                    const float dist = std::sqrt(dsq);
+                    float signedDist = dist;
+                    if (triIdx >= 0) {
+                        const glm::vec3& n = bvh.GetTri(triIdx).Normal;
+                        if (glm::dot(p - cp, n) < 0.0f) signedDist = -dist;
+                    }
+                    const float t = std::max(-1.0f, std::min(1.0f,
+                        signedDist / result.MaxDist));
+                    const int q = static_cast<int>(std::lround(t * 32767.0f));
+                    const size_t localIdx = (static_cast<size_t>(lz) * bs + ly) * bs + lx;
+                    wo.LocalPool[poolBase + localIdx] = static_cast<int16_t>(q);
+                }}}
+            }
+
+            const uint32_t finished = doneBricks.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (progress && totalBricks > 0) {
+                progress->Fraction.store(static_cast<float>(finished) /
+                                         static_cast<float>(totalBricks),
+                                         std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(workerCount);
+    for (unsigned i = 0; i < workerCount; ++i) threads.emplace_back(worker, i);
+    for (auto& t : threads) t.join();
+
+    if (progress && progress->Cancel.load(std::memory_order_relaxed)) {
+        RS_LOG_INFO("MeshSDFBakerSparse: bake cancelled (res %u^3, brick %u)",
+                    resolution, brickSize);
+        return BakedSparseSDF{};
+    }
+
+    // After-join concat: sort all (flatBrickIdx, payload) pairs by flatBrickIdx
+    // so BrickIndex offsets follow the converter's (bz,by,bx) row-major order
+    // — gives byte-parity with SDFCacheBuildSparse output, which simplifies
+    // verification (see Phase 15a plan §7).
+    struct Pending {
+        uint32_t FlatIdx;
+        unsigned Worker;
+        uint32_t LocalChunk;
+    };
+    size_t mixedCount = 0;
+    for (const auto& wo : workerOut) mixedCount += wo.LocalMap.size();
+
+    std::vector<Pending> pending;
+    pending.reserve(mixedCount);
+    for (unsigned w = 0; w < workerCount; ++w) {
+        for (const auto& m : workerOut[w].LocalMap) {
+            pending.push_back({ m.first, w, m.second });
+        }
+    }
+    std::sort(pending.begin(), pending.end(),
+              [](const Pending& a, const Pending& b) { return a.FlatIdx < b.FlatIdx; });
+
+    result.BrickPool.resize(static_cast<size_t>(mixedCount) * bsCubed);
+    for (uint32_t poolIdx = 0; poolIdx < pending.size(); ++poolIdx) {
+        const Pending& p = pending[poolIdx];
+        result.BrickIndex[p.FlatIdx] = poolIdx;
+        const WorkerOut& wo = workerOut[p.Worker];
+        const size_t srcBase = static_cast<size_t>(p.LocalChunk) * bsCubed;
+        const size_t dstBase = static_cast<size_t>(poolIdx) * bsCubed;
+        std::memcpy(result.BrickPool.data() + dstBase,
+                    wo.LocalPool.data()     + srcBase,
+                    bsCubed * sizeof(int16_t));
+    }
+    result.OccupiedBrickCount = static_cast<uint32_t>(pending.size());
+
+    if (progress) progress->Fraction.store(1.0f, std::memory_order_relaxed);
+    const auto bakeEnd = std::chrono::steady_clock::now();
+    const double durationMs = std::chrono::duration<double, std::milli>(
+        bakeEnd - bakeStart).count();
+    if (progress) progress->DurationMs.store(durationMs, std::memory_order_relaxed);
+    RS_LOG_INFO("MeshSDFBakerSparse: baked %u^3 @ b%u over %zu tris (occ=%u/%zu, %.1f ms)",
+                resolution, brickSize, tris.size(),
+                result.OccupiedBrickCount, indexCount, durationMs);
     return result;
 }
 

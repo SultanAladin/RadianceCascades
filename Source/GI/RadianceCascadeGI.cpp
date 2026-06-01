@@ -70,16 +70,37 @@ void RadianceCascadeGI::SetFrameResources(const OffscreenTargets* targets,
     m_ShaderDir = shaderArtifactsDir ? shaderArtifactsDir : "Artifacts/Shaders";
 }
 
-void RadianceCascadeGI::SetSDFView(VkImageView view, VkSampler sampler,
-                                   const glm::vec3& aabbMin, const glm::vec3& aabbMax,
-                                   float maxDist, bool hasSDF) {
-    m_SdfView  = view;
-    if (sampler != VK_NULL_HANDLE) m_SdfSampler = sampler;
-    m_AabbMin  = aabbMin;
-    m_AabbMax  = aabbMax;
-    m_MaxDist  = maxDist;
-    m_HasSDF   = hasSDF;
-    if (m_RelightSdfSet != VK_NULL_HANDLE) {
+void RadianceCascadeGI::SetSDFView(const ResidentSparseSDF* sparse, bool hasSDF) {
+    auto log2Ceil = [](uint32_t v) {
+        uint32_t r = 0; while ((1u << r) < v) ++r; return r;
+    };
+    if (sparse && hasSDF) {
+        m_HasSDF      = true;
+        m_IndexBuffer = sparse->IndexBuffer;
+        m_PoolBuffer  = sparse->PoolBuffer;
+        m_IndexBytes  = sparse->IndexBytes;
+        m_PoolBytes   = sparse->PoolBytes;
+        m_AabbMin     = sparse->AABBMin;
+        m_AabbMax     = sparse->AABBMax;
+        m_MaxDist     = sparse->MaxDist;
+        const uint32_t bs = sparse->BrickSize ? sparse->BrickSize : 8u;
+        const float decode = sparse->MaxDist > 0.0f
+                                 ? (sparse->MaxDist / 32767.0f) : 0.0f;
+        m_SparseParams.AABBMin = glm::vec4(sparse->AABBMin, sparse->MaxDist);
+        m_SparseParams.AABBMax = glm::vec4(sparse->AABBMax, decode);
+        m_SparseParams.Dims    = glm::uvec4(sparse->Resolution,
+                                            bs,
+                                            sparse->BrickGrid,
+                                            log2Ceil(bs));
+    } else {
+        m_HasSDF      = false;
+        m_IndexBuffer = VK_NULL_HANDLE;
+        m_PoolBuffer  = VK_NULL_HANDLE;
+        m_IndexBytes  = 0;
+        m_PoolBytes   = 0;
+        m_SparseParams = {};
+    }
+    if (m_RelightSdfSets[0] != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_Ctx->Device);
         RewriteSdfDescriptors();
     }
@@ -88,8 +109,9 @@ void RadianceCascadeGI::SetSDFView(VkImageView view, VkSampler sampler,
 void RadianceCascadeGI::Initialize(const VulkanContext& ctx, const GlobalSDF& sdf) {
     m_Ctx       = &ctx;
     m_GlobalSdf = &sdf;
-    m_SdfSampler= sdf.Sampler;
-    m_SdfView   = sdf.DummyView;     // safe default until SetSDFView lands real one
+    // Phase 15e: sparse path. No image sampler is involved; the SparseParams
+    // UBO + dummy SSBO buffers keep bindings valid until SetSDFView lands
+    // real residency.
 
     const int  log2Want = m_Settings ? m_Settings->HashLog2 : 20;
     const uint32_t log2 = static_cast<uint32_t>(std::max(16, std::min(22, log2Want)));
@@ -135,7 +157,23 @@ void RadianceCascadeGI::Terminate() {
     m_InsertGBufferSets = {};
     m_ComposeGBufferSets = {};
     m_ComposeLightHdrSets = {};
-    m_RelightSdfSet = VK_NULL_HANDLE;
+    m_RelightSdfSets = {};
+
+    // SparseParams UBO ring + dummy sparse buffer.
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        if (m_SparseUboMapped[i]) {
+            vkUnmapMemory(m_Ctx->Device, m_SparseUboMemory[i]);
+            m_SparseUboMapped[i] = nullptr;
+        }
+        if (m_SparseUboBuffers[i]) vkDestroyBuffer(m_Ctx->Device, m_SparseUboBuffers[i], nullptr);
+        if (m_SparseUboMemory [i]) vkFreeMemory   (m_Ctx->Device, m_SparseUboMemory [i], nullptr);
+    }
+    m_SparseUboBuffers = {};
+    m_SparseUboMemory  = {};
+    if (m_DummySparseBuffer) vkDestroyBuffer(m_Ctx->Device, m_DummySparseBuffer, nullptr);
+    if (m_DummySparseMemory) vkFreeMemory   (m_Ctx->Device, m_DummySparseMemory, nullptr);
+    m_DummySparseBuffer = VK_NULL_HANDLE;
+    m_DummySparseMemory = VK_NULL_HANDLE;
 
     RadianceCascadeHashTerminate(m_Hash, *m_Ctx);
     m_Ctx = nullptr;
@@ -167,6 +205,27 @@ void RadianceCascadeGI::DrawImGuiParams() {
 
     ImGui::TextDisabled("Hash slots: 2^%u (%u). SDF resident: %s.",
                         m_Hash.HashLog2, m_Hash.SlotCount, m_HasSDF ? "yes" : "no");
+
+    // Phase 14c: probe-count line. Read the most recently staged slot. The host
+    // pointer is updated by GPU memcpy-on-coherent-memory; after BeginFrame's
+    // fence wait, at least the slot for the current-frame in-flight cycle is
+    // GPU-stable. Across all kFramesInFlight slots we pick the max to mask the
+    // first-N-frames warmup where some slots haven't been written yet.
+    uint32_t probeCount = 0;
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        const uint32_t v = RadianceCascadeHashReadProbeCount(m_Hash, i);
+        if (v > probeCount) probeCount = v;
+    }
+    const uint32_t cap     = m_Hash.SlotCount;
+    const float    loadPct = cap ? (100.0f * static_cast<float>(probeCount) /
+                                            static_cast<float>(cap))
+                                 : 0.0f;
+    if (m_HasReadback) {
+        ImGui::Text("Probes: %u / 2^%u (load %.2f%%)",
+                    probeCount, m_Hash.HashLog2, loadPct);
+    } else {
+        ImGui::TextDisabled("Probes: (no readback yet — enable GI + run a frame)");
+    }
 }
 
 // --------------------------- descriptors / pipelines --------------------------
@@ -235,50 +294,137 @@ void RadianceCascadeGI::RewriteGBufferDescriptors() {
 }
 
 bool RadianceCascadeGI::CreateSdfDescriptors() {
-    VkDescriptorSetLayoutBinding b{};
-    b.binding = 0;
-    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    b.descriptorCount = 1;
-    b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    auto findMem = [&](uint32_t bits, VkMemoryPropertyFlags want) -> int {
+        VkPhysicalDeviceMemoryProperties props{};
+        vkGetPhysicalDeviceMemoryProperties(m_Ctx->PhysicalDevice, &props);
+        for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            if ((bits & (1u << i)) &&
+                (props.memoryTypes[i].propertyFlags & want) == want)
+                return int(i);
+        }
+        return -1;
+    };
+
+    // Set layout: (0) BrickIndex SSBO, (1) BrickPool SSBO, (2) SparseParams UBO.
+    VkDescriptorSetLayoutBinding b[3]{};
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1] = b[0]; b[1].binding = 1;
+    b[2].binding = 2;
+    b[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 1; lci.pBindings = &b;
+    lci.bindingCount = 3; lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(m_Ctx->Device, &lci, nullptr,
                                     &m_RelightSdfSetLayout) != VK_SUCCESS) {
         RS_LOG_ERROR("RC GI: relight SDF layout failed"); return false;
     }
 
-    VkDescriptorPoolSize sz{};
-    sz.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; sz.descriptorCount = 1;
+    // SparseParams UBO ring (host-visible coherent).
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.size  = sizeof(SparseParams);
+        bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        if (vkCreateBuffer(m_Ctx->Device, &bci, nullptr,
+                           &m_SparseUboBuffers[i]) != VK_SUCCESS) return false;
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(m_Ctx->Device, m_SparseUboBuffers[i], &req);
+        const int mt = findMem(req.memoryTypeBits,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mt < 0) return false;
+        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.allocationSize = req.size; mai.memoryTypeIndex = uint32_t(mt);
+        if (vkAllocateMemory(m_Ctx->Device, &mai, nullptr,
+                             &m_SparseUboMemory[i]) != VK_SUCCESS) return false;
+        vkBindBufferMemory(m_Ctx->Device, m_SparseUboBuffers[i],
+                           m_SparseUboMemory[i], 0);
+        if (vkMapMemory(m_Ctx->Device, m_SparseUboMemory[i], 0, req.size, 0,
+                        &m_SparseUboMapped[i]) != VK_SUCCESS) return false;
+        std::memset(m_SparseUboMapped[i], 0, sizeof(SparseParams));
+    }
+
+    // Dummy 16-byte device-local SSBO (binds both 0 and 1 when no real residency).
+    {
+        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.size  = 16;
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (vkCreateBuffer(m_Ctx->Device, &bci, nullptr,
+                           &m_DummySparseBuffer) != VK_SUCCESS) return false;
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(m_Ctx->Device, m_DummySparseBuffer, &req);
+        const int mt = findMem(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt < 0) return false;
+        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.allocationSize = req.size; mai.memoryTypeIndex = uint32_t(mt);
+        if (vkAllocateMemory(m_Ctx->Device, &mai, nullptr,
+                             &m_DummySparseMemory) != VK_SUCCESS) return false;
+        vkBindBufferMemory(m_Ctx->Device, m_DummySparseBuffer,
+                           m_DummySparseMemory, 0);
+    }
+
+    // Pool: 2 SSBOs + 1 UBO per frame.
+    VkDescriptorPoolSize sizes[2]{};
+    sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[0].descriptorCount = 2 * VulkanContext::kFramesInFlight;
+    sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sizes[1].descriptorCount = 1 * VulkanContext::kFramesInFlight;
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets = 1; pci.poolSizeCount = 1; pci.pPoolSizes = &sz;
+    pci.maxSets = VulkanContext::kFramesInFlight;
+    pci.poolSizeCount = 2; pci.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(m_Ctx->Device, &pci, nullptr,
                                &m_RelightSdfPool) != VK_SUCCESS) {
         RS_LOG_ERROR("RC GI: relight SDF pool failed"); return false;
     }
+
+    VkDescriptorSetLayout layouts[VulkanContext::kFramesInFlight]{};
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i)
+        layouts[i] = m_RelightSdfSetLayout;
     VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     ai.descriptorPool = m_RelightSdfPool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &m_RelightSdfSetLayout;
-    if (vkAllocateDescriptorSets(m_Ctx->Device, &ai, &m_RelightSdfSet) != VK_SUCCESS) {
+    ai.descriptorSetCount = VulkanContext::kFramesInFlight;
+    ai.pSetLayouts = layouts;
+    if (vkAllocateDescriptorSets(m_Ctx->Device, &ai,
+                                 m_RelightSdfSets.data()) != VK_SUCCESS) {
         RS_LOG_ERROR("RC GI: relight SDF set alloc failed"); return false;
     }
+
     RewriteSdfDescriptors();
     return true;
 }
 
 void RadianceCascadeGI::RewriteSdfDescriptors() {
-    if (m_RelightSdfSet == VK_NULL_HANDLE) return;
-    VkDescriptorImageInfo ii{};
-    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ii.imageView   = m_SdfView ? m_SdfView : (m_GlobalSdf ? m_GlobalSdf->DummyView : VK_NULL_HANDLE);
-    ii.sampler     = m_SdfSampler;
-    if (ii.imageView == VK_NULL_HANDLE || ii.sampler == VK_NULL_HANDLE) return;
-    VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-    w.dstSet = m_RelightSdfSet; w.dstBinding = 0;
-    w.descriptorCount = 1;
-    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w.pImageInfo = &ii;
-    vkUpdateDescriptorSets(m_Ctx->Device, 1, &w, 0, nullptr);
+    if (m_RelightSdfSets[0] == VK_NULL_HANDLE) return;
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        if (m_SparseUboMapped[i])
+            std::memcpy(m_SparseUboMapped[i], &m_SparseParams, sizeof(SparseParams));
+
+        VkDescriptorBufferInfo idxInfo{}, poolInfo{}, paramsInfo{};
+        idxInfo.buffer = (m_HasSDF && m_IndexBuffer) ? m_IndexBuffer : m_DummySparseBuffer;
+        idxInfo.offset = 0;
+        idxInfo.range  = (m_HasSDF && m_IndexBuffer) ? m_IndexBytes : 16;
+        poolInfo.buffer = (m_HasSDF && m_PoolBuffer) ? m_PoolBuffer : m_DummySparseBuffer;
+        poolInfo.offset = 0;
+        poolInfo.range  = (m_HasSDF && m_PoolBuffer) ? m_PoolBytes : 16;
+        paramsInfo.buffer = m_SparseUboBuffers[i];
+        paramsInfo.offset = 0;
+        paramsInfo.range  = sizeof(SparseParams);
+
+        VkWriteDescriptorSet w[3]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = m_RelightSdfSets[i]; w[0].dstBinding = 0;
+        w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[0].pBufferInfo = &idxInfo;
+        w[1] = w[0]; w[1].dstBinding = 1; w[1].pBufferInfo = &poolInfo;
+        w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[2].dstSet = m_RelightSdfSets[i]; w[2].dstBinding = 2;
+        w[2].descriptorCount = 1;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[2].pBufferInfo = &paramsInfo;
+        vkUpdateDescriptorSets(m_Ctx->Device, 3, w, 0, nullptr);
+    }
 }
 
 bool RadianceCascadeGI::CreateLightHdrDescriptors() {
@@ -512,7 +658,8 @@ void RadianceCascadeGI::RecordPreFrame(VkCommandBuffer cmd, const FrameContext& 
     if (m_HasSDF) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_RelightPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                m_RelightLayout, 0, 1, &m_RelightSdfSet, 0, nullptr);
+                                m_RelightLayout, 0, 1,
+                                &m_RelightSdfSets[frame.FrameSlot], 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 m_RelightLayout, 1, 1,
                                 &m_Hash.Sets[frame.FrameSlot], 0, nullptr);
@@ -591,6 +738,12 @@ void RadianceCascadeGI::RecordGather(VkCommandBuffer cmd, const FrameContext& fr
                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    // Phase 14c: stage CellList[0] for host-side probe-count readout. Records
+    // its own compute->transfer barrier on CellListBuffer internally.
+    RadianceCascadeHashRecordReadback(m_Hash, cmd, frame.FrameSlot);
+    m_LastReadbackSlot = frame.FrameSlot;
+    m_HasReadback      = true;
 }
 
 void RadianceCascadeGI::RecordCompose(VkCommandBuffer cmd, const FrameContext& frame) {

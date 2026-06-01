@@ -14,8 +14,9 @@ namespace RS {
 
 namespace {
 
-constexpr uint32_t kFrameBindingCount = 10;   // 0..9 (GBuffer + IBL + LightHDR)
+constexpr uint32_t kFrameBindingCount = 11;   // 0..10 (GBuffer + IBL + LightHDR + Specular)
 constexpr uint32_t kLightHDRBinding   = 9;
+constexpr uint32_t kSpecularBinding   = 10;
 
 bool ReadFile(const char* path, std::vector<char>& out) {
     FILE* f = std::fopen(path, "rb");
@@ -65,6 +66,11 @@ bool CreateFrameSetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
     b[9].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[9].descriptorCount = 1;
     b[9].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    // 10 Specular SRV (KHR_materials_specular)
+    b[10].binding         = kSpecularBinding;
+    b[10].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[10].descriptorCount = 1;
+    b[10].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     lci.bindingCount = kFrameBindingCount;
@@ -81,9 +87,9 @@ bool CreateEmptySetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
 bool CreateDescriptorPool(VkDevice device, VkDescriptorPool& outPool) {
     VkDescriptorPoolSize sizes[2]{};
     sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = 9 * VulkanContext::kFramesInFlight;
+    sizes[0].descriptorCount = 10 * VulkanContext::kFramesInFlight; // 9 + Specular
     sizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[1].descriptorCount = 1 * VulkanContext::kFramesInFlight;
+    sizes[1].descriptorCount = 1  * VulkanContext::kFramesInFlight;
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets       = VulkanContext::kFramesInFlight + 1;    // +1 for the GI stub set
@@ -136,6 +142,10 @@ bool AllocateFrameSets(VkDevice device, LightingPass& lp,
         infos[9].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         infos[9].imageView   = f.LightHDR.View;
         infos[9].sampler     = VK_NULL_HANDLE;
+        // Specular SRV.
+        infos[10].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        infos[10].imageView   = f.Specular.View;
+        infos[10].sampler     = targets.SamplerLinear;
 
         VkWriteDescriptorSet writes[kFrameBindingCount]{};
         for (uint32_t b = 0; b < kFrameBindingCount; ++b) {
@@ -310,7 +320,8 @@ void LightingPassRecord(LightingPass& lp, const VulkanContext& /*ctx*/,
                         float sunIntensity,
                         float ambient,
                         bool  iblEnabled,
-                        float iblIntensity) {
+                        float iblIntensity,
+                        bool  realisticPbr) {
     if (!lp.Initialized) return;
     const OffscreenFrame& f = targets.Frames[frameSlot];
 
@@ -352,10 +363,15 @@ void LightingPassRecord(LightingPass& lp, const VulkanContext& /*ctx*/,
     pc.EyePosWorld        = glm::vec4(camera.EyePositionWorld, ambient);
     pc.SunDirAndIntensity = glm::vec4(glm::normalize(sunDirectionToward), sunIntensity);
     pc.SunColor           = glm::vec4(sunColor, 0.0f);
+    // IblParams.w carries the PBR flag word as float-bits (shader decodes via
+    // floatBitsToUint). Bit 0 = realistic PBR (EON + energy comp).
+    const uint32_t pbrFlags = realisticPbr ? PbrFlags::Realistic : 0u;
+    float pbrFlagsAsFloat;
+    std::memcpy(&pbrFlagsAsFloat, &pbrFlags, sizeof(pbrFlagsAsFloat));
     pc.IblParams          = glm::vec4(iblEnabled ? 1.0f : 0.0f,
                                       iblIntensity,
                                       static_cast<float>(SkyAtmosphere::kPrefilterMips),
-                                      0.0f);
+                                      pbrFlagsAsFloat);
     pc.ResAndFlags        = glm::vec4(static_cast<float>(lp.RenderExtent.width),
                                       static_cast<float>(lp.RenderExtent.height),
                                       0.0f, 0.0f);

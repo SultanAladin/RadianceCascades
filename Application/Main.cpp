@@ -92,15 +92,12 @@ void DrawSunPanel(RS::GBufferPreviewSettings& preview,
 
 void DrawSkyPanel(RS::SkySettings& s) {
     ImGui::SetNextWindowPos (ImVec2(640.0f, 470.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(320.0f, 320.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320.0f, 220.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Sky")) {
-        ImGui::TextUnformatted("Gradient");
-        ImGui::ColorEdit3 ("Zenith",     &s.ZenithColor.x);
-        ImGui::ColorEdit3 ("Horizon",    &s.HorizonColor.x);
-        ImGui::ColorEdit3 ("Ground",     &s.GroundColor.x);
-        ImGui::SliderFloat("Horizon exp", &s.HorizonExponent, 0.2f, 6.0f);
-        ImGui::SliderFloat("Ground exp",  &s.GroundExponent,  0.2f, 6.0f);
-        ImGui::SliderFloat("Sky intensity", &s.SkyIntensity,  0.0f, 4.0f);
+        ImGui::TextUnformatted("Sky inscatter");
+        ImGui::SliderFloat("Sky intensity", &s.SkyIntensity, 0.0f, 4.0f);
+        ImGui::TextDisabled("Master gain on scattered sky radiance (decoupled\n"
+                            "from sun intensity so IBL stays balanced).");
 
         ImGui::Separator();
         ImGui::TextUnformatted("Sun disc (in sky cube)");
@@ -492,36 +489,59 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     sdfBaker.TargetSourcePath = kShaderBallPath;
     RS::SdfBakerInitialize(sdfBaker, vk);
 
-    // Phase 12: try to auto-load a previously-cached SDF for the ShaderBall at
-    // the default 64^3. If the cache hit, also load the CPU copy so the slice
-    // preview is populated; otherwise the panel shows "Click Bake".
+    // Phase 12 boot auto-load. Phase 15g flipped the priority: try the sparse
+    // .rsdfvdb first (matches the new default UseSparse=true), fall back to the
+    // legacy dense .rsdf only if no sparse file exists for the resolution.
+    // Either residency may end up populated; both paths feed pushSdfToConsumers-
+    // equivalent wiring below so the cone shadow / RC GI / preview binders all
+    // see whichever residency exists.
     if (shaderBall != 0) {
-        const uint32_t bootRes = RS::SdfBakerResolutionPx(sdfBaker);
-        if (RS::GlobalSDFTryLoadFromCache(globalSdf, vk, shaderBall,
-                                          kShaderBallPath, bootRes)) {
+        const uint32_t bootRes   = RS::SdfBakerResolutionPx(sdfBaker);
+        const uint32_t bootBrick = 8u;   // matches cached shaderBall_*_b8.rsdfvdb
+
+        bool sparseHit = RS::GlobalSDFTryLoadSparseFromCache(
+            globalSdf, vk, shaderBall, kShaderBallPath, bootRes, bootBrick);
+
+        // Dense load is still attempted: the dense view drives the SDFSlice
+        // debug viewer's legacy "Dense .rsdf" mode and seeds the CPU slice
+        // preview (sparse → CPU decode lands in Phase 15g-follow-on). On a
+        // pure-sparse machine the dense file is just absent and this no-ops.
+        bool denseHit = RS::GlobalSDFTryLoadFromCache(globalSdf, vk, shaderBall,
+                                                     kShaderBallPath, bootRes);
+        if (denseHit) {
             auto baked = std::make_shared<RS::BakedSDF>();
             const std::string p = RS::SDFCacheDerivePath(kShaderBallPath, bootRes);
             if (RS::SDFCacheLoad(p.c_str(), *baked)) {
                 sdfBaker.ResidentBakedCopy = baked;
                 sdfBaker.SliceDirty = true;
             }
-            // Refresh GBufferPreview's binding to point at the freshly-resident
-            // SDF instead of the dummy, and hand the residency to the shadow
-            // algo if it's SDFConeShadow (a no-op for the other variants).
             if (const RS::ResidentSDF* r = RS::GlobalSDFGet(globalSdf, shaderBall)) {
                 RS::GBufferPreviewSetSDF(preview, vk, r->View, globalSdf.Sampler);
+            }
+        }
+
+        if (sparseHit) {
+            if (const RS::ResidentSparseSDF* rs = RS::GlobalSDFGetSparse(globalSdf, shaderBall)) {
                 if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
-                    cone->SetSDF(r->View, globalSdf.Sampler,
-                                 r->AABBMin, r->AABBMax, r->MaxDist, true);
+                    cone->SetSDF(rs, true);
                 }
                 if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
-                    rcgi->SetSDFView(r->View, globalSdf.Sampler,
-                                     r->AABBMin, r->AABBMax, r->MaxDist, true);
+                    rcgi->SetSDFView(rs, true);
                 }
+                RS::GBufferPreviewSetSparseSDF(preview, vk,
+                                               rs->IndexBuffer, rs->IndexBytes,
+                                               rs->PoolBuffer,  rs->PoolBytes);
             }
-            RS_LOG_INFO("Phase 12: SDF cache hit for ShaderBall at %u^3", bootRes);
+        }
+
+        if (sparseHit && denseHit) {
+            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (sparse + dense)", bootRes);
+        } else if (sparseHit) {
+            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (sparse only — legacy dense absent)", bootRes);
+        } else if (denseHit) {
+            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (dense only — bake to produce .rsdfvdb)", bootRes);
         } else {
-            RS_LOG_INFO("Phase 12: no SDF cache for ShaderBall — open the SDF Baker window");
+            RS_LOG_INFO("Phase 15g: no SDF cache for ShaderBall — open the SDF Baker window");
         }
     }
 
@@ -565,6 +585,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::DrawGridPanel     (gridSettings);
         DrawSunPanel          (previewSettings, skySettings);
         DrawSkyPanel          (skySettings);
+        RS::DrawAtmospherePanel(skySettings);
         RS::DrawScenePanel    (panelSel, shaderBall, scene,
                                static_cast<size_t>(gridCurrentN * gridCurrentN));
         RS::DrawMaterialsPanel(panelSel, materials,
@@ -584,27 +605,37 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // preview pass and the shadow algo if it's currently SDFConeShadow.
         auto pushSdfToConsumers = [&]() {
             activeSdfMesh = sdfBaker.TargetMesh;
+            // Dense residency drives the GBufferPreview SDFSlice debug view
+            // (Phase 15f will move it onto sparse too).
             const RS::ResidentSDF* r =
                 RS::GlobalSDFGet(globalSdf, sdfBaker.TargetMesh);
-            VkImageView view = r ? r->View : globalSdf.DummyView;
-            glm::vec3   aMin = r ? r->AABBMin : glm::vec3(0.0f);
-            glm::vec3   aMax = r ? r->AABBMax : glm::vec3(1.0f);
-            float       md   = r ? r->MaxDist : 1.0f;
-            bool        has  = (r != nullptr);
-            RS::GBufferPreviewSetSDF(preview, vk, view, globalSdf.Sampler);
+            VkImageView denseView = r ? r->View : globalSdf.DummyView;
+            RS::GBufferPreviewSetSDF(preview, vk, denseView, globalSdf.Sampler);
+
+            // Phase 15d/e: cone shadow + GI relight read sparse residency.
+            const RS::ResidentSparseSDF* rs =
+                RS::GlobalSDFGetSparse(globalSdf, sdfBaker.TargetMesh);
+            const bool hasSparse = (rs != nullptr);
             if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
-                cone->SetSDF(view, globalSdf.Sampler, aMin, aMax, md, has);
+                cone->SetSDF(rs, hasSparse);
             }
             if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
-                rcgi->SetSDFView(view, globalSdf.Sampler, aMin, aMax, md, has);
+                rcgi->SetSDFView(rs, hasSparse);
             }
+            // Phase 15f — also wire sparse SSBOs into the debug-slice preview.
+            // Falls back to the always-bound dummy when no sparse residency exists.
+            RS::GBufferPreviewSetSparseSDF(preview, vk,
+                                           hasSparse ? rs->IndexBuffer : VK_NULL_HANDLE,
+                                           hasSparse ? rs->IndexBytes  : 0,
+                                           hasSparse ? rs->PoolBuffer  : VK_NULL_HANDLE,
+                                           hasSparse ? rs->PoolBytes   : 0);
         };
         if (sdfResidencyChanged) pushSdfToConsumers();
 
         // Phase 14a: Render Settings panel — master GI toggle + algo combo.
         // Returns the requested algo variant (0/1) if the combo changed,
         // -1 otherwise. Hot-swap mirrors the shadow path below.
-        const int requestedGiSwap = RS::DrawRenderSettingsPanel(renderSettings, gi.get());
+        const int requestedGiSwap = RS::DrawRenderSettingsPanel(renderSettings, gi.get(), &skySettings);
         if (requestedGiSwap >= 0) {
             vkDeviceWaitIdle(vk.Device);
             gi->Terminate();
@@ -693,6 +724,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
 
         // Phase 8: bake sky / IBL cubemaps if the settings changed since last
         // frame. Hash gate makes the steady-state cost a single comparison.
+        // Phase B bug fix: sync the live sun direction (driven by Sun panel)
+        // into SkySettings so the sky cube tracks the same sun the lighting
+        // compose uses.
+        skySettings.SunDirection = glm::normalize(previewSettings.SunDirection);
         RS::SkyAtmosphereEnsureBaked(sky, vk, frame.Cmd, skySettings);
         RS::GridPassRecord       (grid, vk, frame.Cmd, frame.ImageIndex, view, gridSettings);
         RS::GBufferPassRecord    (gbuffer, vk, frame.Cmd, frame.FrameSlot, view,
@@ -754,7 +789,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                                *shadow, view, previewSettings.SunDirection,
                                glm::vec3(1.0f), previewSettings.SunIntensity,
                                previewSettings.Ambient,
-                               previewSettings.UseIBL, previewSettings.IBLIntensity);
+                               previewSettings.UseIBL, previewSettings.IBLIntensity,
+                               renderSettings.PBR.RealisticPbr);
 
         // Phase 14b: RC × Hash compose modulates LightHDR by GI + handles
         // GIDebugView. SDFGI has no compose path; only RC implements it.

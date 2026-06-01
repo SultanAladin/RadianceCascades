@@ -113,10 +113,16 @@ bool CreateRenderPass(VkDevice device, VkFormat swapFormat, VkRenderPass& outPas
 }
 
 bool CreateSetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
-    // 0..5 = GBuffer slots, 6 = irradiance cube, 7 = prefilter cube, 8 = BRDF LUT,
-    // 9 = LightHDR (Phase 10 — lit mode samples this), 10 = SDF 3D image
-    // (Phase 12 — SDF-slice view), 11 = SDF params UBO (Phase 12).
-    VkDescriptorSetLayoutBinding bindings[12]{};
+    // 0..5  = GBuffer slots
+    // 6     = irradiance cube
+    // 7     = prefilter cube
+    // 8     = BRDF LUT
+    // 9     = LightHDR (Phase 10 — lit mode samples this)
+    // 10    = SDF 3D image (Phase 12 — SDF-slice dense view)
+    // 11    = SDF params UBO (Phase 12; grew to 96 B in 15f)
+    // 12    = Specular SRV (KHR_materials_specular)
+    // 13,14 = Sparse SDF SSBOs (Phase 15f — BrickIndex + BrickPool)
+    VkDescriptorSetLayoutBinding bindings[15]{};
     for (uint32_t i = 0; i < 11; ++i) {
         bindings[i].binding         = i;
         bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -127,20 +133,35 @@ bool CreateSetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
     bindings[11].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[11].descriptorCount = 1;
     bindings[11].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[12].binding         = 12;
+    bindings[12].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[12].descriptorCount = 1;
+    bindings[12].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[13].binding         = 13;
+    bindings[13].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[13].descriptorCount = 1;
+    bindings[13].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[14].binding         = 14;
+    bindings[14].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[14].descriptorCount = 1;
+    bindings[14].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = 12;
+    lci.bindingCount = 15;
     lci.pBindings    = bindings;
     return vkCreateDescriptorSetLayout(device, &lci, nullptr, &outLayout) == VK_SUCCESS;
 }
 
-// Phase 12 SDF UBO (must match GLSL std140 layout — 48 bytes after Phase 12.5
-// added a viz-mode slot for the slice-mode debug ramps).
+// Phase 12 → 15f SDF UBO (must match GLSL std140 layout). 96 bytes after
+// 15f added the sparse AABB/dims trio.
 struct SdfPushUbo {
-    glm::vec4 AABBMinAndPlaneY;  // xyz = AABB min, w = world-Y of slice plane
-    glm::vec4 AABBMaxAndMaxDist; // xyz = AABB max, w = R16_SNORM decode scale
-    glm::vec4 PreviewParams;     // x = SDFVizMode (float), yzw reserved
+    glm::vec4  AABBMinAndPlaneY;  // xyz = dense AABB min, w = world-Y of slice plane
+    glm::vec4  AABBMaxAndMaxDist; // xyz = dense AABB max, w = R16_SNORM decode scale
+    glm::vec4  PreviewParams;     // x = SDFVizMode (float), y = SliceSource (0=dense,1=sparse), zw reserved
+    glm::vec4  SparseAABBMin;     // xyz = sparse AABB min, w = sparse MaxDist
+    glm::vec4  SparseAABBMax;     // xyz = sparse AABB max, w = sparse decode scale (MaxDist/32767)
+    glm::uvec4 SparseDims;        // x = res, y = brickSize, z = brickGrid, w = bsLog2
 };
-static_assert(sizeof(SdfPushUbo) == 48, "SdfPushUbo must be 48 bytes");
+static_assert(sizeof(SdfPushUbo) == 96, "SdfPushUbo must be 96 bytes");
 
 int FindMemoryType(VkPhysicalDevice pd, uint32_t typeBits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties props{};
@@ -268,15 +289,17 @@ bool CreateDescriptorSets(VkDevice device, GBufferPreviewPass& pp,
                           const SkyAtmosphere& sky,
                           VkSampler sdfFallbackSampler,
                           VkImageView sdfFallbackView) {
-    VkDescriptorPoolSize sizes[2]{};
+    VkDescriptorPoolSize sizes[3]{};
     sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sizes[0].descriptorCount = 11 * VulkanContext::kFramesInFlight;
+    sizes[0].descriptorCount = 12 * VulkanContext::kFramesInFlight; // 11 + Specular
     sizes[1].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[1].descriptorCount = 1  * VulkanContext::kFramesInFlight;
+    sizes[2].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[2].descriptorCount = 2  * VulkanContext::kFramesInFlight; // sparse idx + pool
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets       = VulkanContext::kFramesInFlight;
-    pci.poolSizeCount = 2;
+    pci.poolSizeCount = 3;
     pci.pPoolSizes    = sizes;
     if (vkCreateDescriptorPool(device, &pci, nullptr, &pp.DescriptorPool) != VK_SUCCESS) {
         return false;
@@ -297,7 +320,7 @@ bool CreateDescriptorSets(VkDevice device, GBufferPreviewPass& pp,
     for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
         const OffscreenFrame& f = targets.Frames[i];
 
-        VkDescriptorImageInfo infos[11]{};
+        VkDescriptorImageInfo infos[12]{};
         // GBuffer (0..5)
         const VkImageView views[6] = {
             f.Albedo.View,
@@ -334,13 +357,27 @@ bool CreateDescriptorSets(VkDevice device, GBufferPreviewPass& pp,
         infos[10].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         infos[10].imageView   = sdfFallbackView;
         infos[10].sampler     = sdfFallbackSampler;
+        // KHR specular SRV (binding 12, written below).
+        infos[11].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        infos[11].imageView   = f.Specular.View;
+        infos[11].sampler     = targets.SamplerLinear;
 
         VkDescriptorBufferInfo uboInfo{};
         uboInfo.buffer = pp.SdfUboBuffers[i];
         uboInfo.offset = 0;
         uboInfo.range  = sizeof(SdfPushUbo);
 
-        VkWriteDescriptorSet writes[12]{};
+        // Phase 15f — bind the dummy SSBO at 13/14 initially. Real residency
+        // wires in via GBufferPreviewSetSparseSDF after the first sparse bake.
+        VkDescriptorBufferInfo sparseInfos[2]{};
+        sparseInfos[0].buffer = pp.DummySparseBuffer;
+        sparseInfos[0].offset = 0;
+        sparseInfos[0].range  = VK_WHOLE_SIZE;
+        sparseInfos[1].buffer = pp.DummySparseBuffer;
+        sparseInfos[1].offset = 0;
+        sparseInfos[1].range  = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet writes[15]{};
         for (uint32_t b = 0; b < 11; ++b) {
             writes[b].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[b].dstSet          = pp.FrameSets[i];
@@ -355,9 +392,54 @@ bool CreateDescriptorSets(VkDevice device, GBufferPreviewPass& pp,
         writes[11].descriptorCount = 1;
         writes[11].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writes[11].pBufferInfo     = &uboInfo;
-        vkUpdateDescriptorSets(device, 12, writes, 0, nullptr);
+        writes[12].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[12].dstSet          = pp.FrameSets[i];
+        writes[12].dstBinding      = 12;
+        writes[12].descriptorCount = 1;
+        writes[12].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[12].pImageInfo      = &infos[11];
+        writes[13].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[13].dstSet          = pp.FrameSets[i];
+        writes[13].dstBinding      = 13;
+        writes[13].descriptorCount = 1;
+        writes[13].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[13].pBufferInfo     = &sparseInfos[0];
+        writes[14].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[14].dstSet          = pp.FrameSets[i];
+        writes[14].dstBinding      = 14;
+        writes[14].descriptorCount = 1;
+        writes[14].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[14].pBufferInfo     = &sparseInfos[1];
+        vkUpdateDescriptorSets(device, 15, writes, 0, nullptr);
     }
     return true;
+}
+
+// Phase 15f — 16-byte device-local SSBO that backs bindings 13/14 when no
+// sparse residency exists. Contents are irrelevant (the slice-source flag
+// gates reads), but the buffer must be a real VkBuffer for descriptor-write
+// validation to pass.
+bool CreateDummySparseBuffer(const VulkanContext& ctx, GBufferPreviewPass& pp) {
+    VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bci.size        = 16;
+    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(ctx.Device, &bci, nullptr, &pp.DummySparseBuffer) != VK_SUCCESS) {
+        return false;
+    }
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(ctx.Device, pp.DummySparseBuffer, &req);
+    const int memType = FindMemoryType(ctx.PhysicalDevice, req.memoryTypeBits,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memType < 0) return false;
+    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    mai.allocationSize  = req.size;
+    mai.memoryTypeIndex = static_cast<uint32_t>(memType);
+    if (vkAllocateMemory(ctx.Device, &mai, nullptr, &pp.DummySparseMemory) != VK_SUCCESS) {
+        return false;
+    }
+    return vkBindBufferMemory(ctx.Device, pp.DummySparseBuffer,
+                              pp.DummySparseMemory, 0) == VK_SUCCESS;
 }
 
 bool CreateFramebuffers(VkDevice device, VkRenderPass pass,
@@ -418,7 +500,15 @@ bool GBufferPreviewInitialize(GBufferPreviewPass& pp, const VulkanContext& ctx,
         seed.AABBMinAndPlaneY  = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
         seed.AABBMaxAndMaxDist = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f);
         seed.PreviewParams     = glm::vec4(0.0f);
+        seed.SparseAABBMin     = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        seed.SparseAABBMax     = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f / 32767.0f);
+        seed.SparseDims        = glm::uvec4(1u, 1u, 1u, 0u);
         std::memcpy(pp.SdfUboMapped[i], &seed, sizeof(seed));
+    }
+    // Phase 15f dummy SSBO must exist before descriptor writes reference it.
+    if (!CreateDummySparseBuffer(ctx, pp)) {
+        RS_LOG_ERROR("GBufferPreview: dummy sparse buffer alloc failed");
+        return false;
     }
     if (!CreateDescriptorSets(ctx.Device, pp, targets, sky,
                               sdfFallbackSampler, sdfFallbackView)) {
@@ -456,6 +546,42 @@ void GBufferPreviewSetSDF(GBufferPreviewPass& pp, const VulkanContext& ctx,
     }
 }
 
+void GBufferPreviewSetSparseSDF(GBufferPreviewPass& pp, const VulkanContext& ctx,
+                                VkBuffer indexBuffer, VkDeviceSize indexBytes,
+                                VkBuffer poolBuffer,  VkDeviceSize poolBytes) {
+    if (!pp.Initialized) return;
+    // Null buffers → revert to the dummy. Real residency wires in via the
+    // residency-changed branch in Main.cpp (already gated on vkDeviceWaitIdle
+    // via SdfBakerPanelDrawAndPump's upload-completion path).
+    const VkBuffer     idx   = indexBuffer ? indexBuffer : pp.DummySparseBuffer;
+    const VkDeviceSize iSize = indexBuffer ? indexBytes  : VK_WHOLE_SIZE;
+    const VkBuffer     pool  = poolBuffer  ? poolBuffer  : pp.DummySparseBuffer;
+    const VkDeviceSize pSize = poolBuffer  ? poolBytes   : VK_WHOLE_SIZE;
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        VkDescriptorBufferInfo infos[2]{};
+        infos[0].buffer = idx;
+        infos[0].offset = 0;
+        infos[0].range  = iSize;
+        infos[1].buffer = pool;
+        infos[1].offset = 0;
+        infos[1].range  = pSize;
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet          = pp.FrameSets[i];
+        writes[0].dstBinding      = 13;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo     = &infos[0];
+        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet          = pp.FrameSets[i];
+        writes[1].dstBinding      = 14;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo     = &infos[1];
+        vkUpdateDescriptorSets(ctx.Device, 2, writes, 0, nullptr);
+    }
+}
+
 void GBufferPreviewTerminate(GBufferPreviewPass& pp, const VulkanContext& ctx) {
     if (!pp.Initialized) return;
     vkDeviceWaitIdle(ctx.Device);
@@ -475,6 +601,14 @@ void GBufferPreviewTerminate(GBufferPreviewPass& pp, const VulkanContext& ctx) {
             pp.SdfUboBuffers[i] = VK_NULL_HANDLE;
         }
         pp.SdfUboMapped[i] = nullptr;
+    }
+    if (pp.DummySparseBuffer) {
+        vkDestroyBuffer(ctx.Device, pp.DummySparseBuffer, nullptr);
+        pp.DummySparseBuffer = VK_NULL_HANDLE;
+    }
+    if (pp.DummySparseMemory) {
+        vkFreeMemory(ctx.Device, pp.DummySparseMemory, nullptr);
+        pp.DummySparseMemory = VK_NULL_HANDLE;
     }
 
     if (pp.DescriptorPool) vkDestroyDescriptorPool     (ctx.Device, pp.DescriptorPool, nullptr);
@@ -499,11 +633,25 @@ void GBufferPreviewRecord(GBufferPreviewPass& pp, const VulkanContext& ctx,
                           const SDFSliceState& sdfSlice) {
     // Update this frame's SDF UBO before recording.
     if (pp.SdfUboMapped[frameSlot]) {
+        // bsLog2 helper — same convention used by the sparse helper macros.
+        auto log2Ceil = [](uint32_t v) {
+            uint32_t r = 0; while ((1u << r) < v) ++r; return r;
+        };
+        const uint32_t bs     = sdfSlice.SparseBrickSz ? sdfSlice.SparseBrickSz : 1u;
+        const float    decode = sdfSlice.SparseMaxDist > 0.0f
+                                    ? (sdfSlice.SparseMaxDist / 32767.0f) : 0.0f;
         SdfPushUbo u{};
         u.AABBMinAndPlaneY  = glm::vec4(sdfSlice.AABBMin, sdfSlice.PlaneY);
         u.AABBMaxAndMaxDist = glm::vec4(sdfSlice.AABBMax, sdfSlice.MaxDist);
         u.PreviewParams     = glm::vec4(static_cast<float>(sdfSlice.VizMode),
-                                        0.0f, 0.0f, 0.0f);
+                                        static_cast<float>(static_cast<int>(sdfSlice.Source)),
+                                        0.0f, 0.0f);
+        u.SparseAABBMin     = glm::vec4(sdfSlice.SparseAABBMin, sdfSlice.SparseMaxDist);
+        u.SparseAABBMax     = glm::vec4(sdfSlice.SparseAABBMax, decode);
+        u.SparseDims        = glm::uvec4(sdfSlice.SparseRes,
+                                         bs,
+                                         sdfSlice.SparseBrickGrid,
+                                         log2Ceil(bs));
         std::memcpy(pp.SdfUboMapped[frameSlot], &u, sizeof(u));
     }
     VkRenderPassBeginInfo rpbi{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };

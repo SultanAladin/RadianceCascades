@@ -44,11 +44,19 @@ struct GISettings {
     GIDebugView DebugView = GIDebugView::Off;
 };
 
+// Per-frame PBR settings. RealisticPbr enables the EON 2024 diffuse + Fdez-
+// Aguera 2019 energy-compensated GGX + KHR_materials_specular semantics in
+// the lighting compose. Default: on (cheap path stays available for A/B).
+struct PbrSettings {
+    bool RealisticPbr = true;
+};
+
 // One umbrella settings struct. New render-wide knobs slot in here so the
 // panel + Main.cpp don't have to thread a growing parameter list. v1 holds
-// GI; later phases may add an exposure block, SSR toggles, etc.
+// GI + PBR; later phases may add an exposure block, SSR toggles, etc.
 struct RenderSettings {
-    GISettings GI;
+    GISettings  GI;
+    PbrSettings PBR;
 };
 
 } // namespace RS

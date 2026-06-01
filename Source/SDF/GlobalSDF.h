@@ -116,6 +116,14 @@ ResidentSparseSDF GlobalSDFUploadSparse(GlobalSDF& g, const VulkanContext& ctx,
                                        const BakedSparseSDF& baked,
                                        bool fromCache);
 
+// Phase 15g — convenience: try Cache/SDF/<sourceBase>_<res>_b<brick>.rsdfvdb,
+// load + upload + return true on success. Lets Main.cpp's boot auto-load reach
+// for sparse first and fall back to the dense path only when no .rsdfvdb file
+// exists for the chosen resolution.
+bool GlobalSDFTryLoadSparseFromCache(GlobalSDF& g, const VulkanContext& ctx,
+                                     MeshHandle mesh, const char* sourcePath,
+                                     uint32_t resolution, uint32_t brickSize);
+
 // Write the currently-resident SDF for `mesh` back to disk at the canonical
 // Cache/SDF path. No-op if nothing is resident. Returns true on success.
 bool GlobalSDFSaveResidentToCache(const GlobalSDF& g, MeshHandle mesh,

@@ -1,25 +1,25 @@
-// Source/Shadow/SDFConeShadow.h — Phase 13
+// Source/Shadow/SDFConeShadow.h — Phase 13 (+ Phase 15d sparse rewire)
 // IShadowAlgorithm impl that does NOT render to a shadow atlas. The lighting
-// compose itself does the cone-trace (improved Iñigo Quilez soft-shadow,
-// h*h/(2*y) penumbra tracking — eliminates the banding the classic k*h/t form
-// shows at grazing angles, and ramps the penumbra width proportional to
-// distance which is what we want for soft sun shadows).
+// compose itself does the cone-trace (improved Iñigo Quilez soft-shadow) via
+// the sparse-VDB SDF sampler (Phase 15c brick-aware ray helper) so empty
+// space crosses in one step.
 //
-// Descriptor contract at set=2 for the SDFCone variant:
-//   binding 0 = sampler3D R16_SNORM (the resident mesh SDF — fallback dummy
-//               when no mesh is resident, so the binding is always safe)
-//   binding 1 = AlgoUbo (80 bytes — SunDir, AABBMin/Max+decode, trace params)
-//   binding 2 = InstanceXformBuffer SSBO (per-instance mat4 InverseModel[256]).
-//               The lighting shader reads the GBuffer identity attachment,
-//               looks up the inverse-model matrix, and traces in MESH-LOCAL
-//               space — the SDF was baked in mesh-local space, so the AABB
-//               at binding 1 already lives in the right coord frame.
+// Descriptor contract at set=2 for the SDFCone variant (Phase 15d):
+//   binding 0 = SparseIdx  SSBO  (uint BrickIndex[BrickGrid^3])
+//   binding 1 = SparsePool SSBO  (uint BrickPool[occupied*bs^3/2])
+//   binding 2 = SparseParams UBO (SparseSDFParams: AABB + dims + MaxDist + decode)
+//   binding 3 = AlgoUbo          (48 bytes — sun, trace params, surface off, flags)
+//   binding 4 = InstanceXform SSBO (mat4 InverseModel[256]) — Phase 13.5
 //
-// The view bound at binding 0 has to track the GlobalSDF residency table:
-// `Set` is called from Main.cpp's residency-changed branch (the same spot
-// that calls GBufferPreviewSetSDF). We pre-allocate kFramesInFlight sets and
-// rewrite all of them with a vkDeviceWaitIdle barrier so no in-flight frame
-// reads a stale image view.
+// The sparse storage at bindings 0/1/2 tracks the GlobalSDF::ResidentSparse
+// table: `SetSDF` is called from Main.cpp's residency-changed branch the same
+// way the old dense path was. We pre-allocate kFramesInFlight sets and rewrite
+// all of them under vkDeviceWaitIdle so no in-flight frame samples stale data.
+//
+// **Why mesh-local trace stays.** Meshes can move at runtime. Re-baking on
+// every move is infeasible; the right primitive is one bake per mesh + a
+// per-instance world->mesh-local transform applied in the shader. The C++
+// invModel SSBO already exists from Phase 13.5; sparse just swaps the sampler.
 #pragma once
 
 #include "Shadow/IShadowAlgorithm.h"
@@ -32,6 +32,7 @@
 namespace RS {
 
 struct GlobalSDF;
+struct ResidentSparseSDF;
 
 struct SDFConeParams {
     bool  Enabled        = true;
@@ -65,67 +66,73 @@ public:
                                    uint32_t frameSlot,
                                    uint32_t set) override;
 
-    // Phase 13: hook the shadow algo onto the resident SDF. Called from
-    // Main.cpp at boot + every time GlobalSDF residency changes for the
+    // Phase 15d: hook the shadow algo onto the sparse SDF residency. Called
+    // from Main.cpp at boot + every time GlobalSDF residency changes for the
     // tracked mesh. Re-writes all kFramesInFlight descriptor sets under
-    // vkDeviceWaitIdle so no in-flight frame can sample a dangling view.
-    void SetSDF(VkImageView sdfView, VkSampler sampler,
-                const glm::vec3& aabbMin, const glm::vec3& aabbMax,
-                float maxDist, bool hasSDF);
+    // vkDeviceWaitIdle so no in-flight frame can sample dangling SSBOs.
+    // Pass nullptr / hasSDF=false to bind a dummy (lights stay full-bright).
+    void SetSDF(const ResidentSparseSDF* sparse, bool hasSDF);
 
     // Phase 13.5: per-instance inverse-model SSBO ring (one per frame-in-flight).
-    // Bound at set=2 binding 2. Main.cpp wires this once after Initialize;
-    // rebinding happens under vkDeviceWaitIdle so no in-flight frame sees a
-    // dangling buffer.
+    // Bound at set=2 binding 4. Main.cpp wires this once after Initialize.
     void SetInstanceXformBuffer(const VkBuffer* ssbosByFrame, VkDeviceSize bytesPerSlot);
 
-    // Latest-known residency state. SetSDF stores into these so RecordShadowPass
-    // can stamp the UBO without the caller passing the geometry every frame.
     bool HasSDF() const { return m_HasSDF; }
 
 private:
-    bool CreateSampler();
     bool CreateSetLayout();
     bool CreateAlgoUbos();
+    bool CreateSparseParamsUbos();
+    bool CreateDummySparseBuffers();
     bool CreateDescriptorSets();
     void RewriteAllSets();
     void UpdateAlgoUbo(uint32_t frameSlot, const FrameContext& frame);
+    void UpdateSparseParamsUbo(uint32_t frameSlot);
 
     const VulkanContext* m_Ctx = nullptr;
     SDFConeParams        m_Params{};
 
-    // Linear/clamp sampler. The SDF image itself comes from GlobalSDF, but the
-    // sampler lives here so we don't have to ferry it through. Matches
-    // GlobalSDF::Sampler's filter/clamp settings.
-    VkSampler m_LinearClampSampler = VK_NULL_HANDLE;
+    // Sparse residency snapshot, updated only via SetSDF().
+    bool       m_HasSDF        = false;
+    VkBuffer   m_IndexBuffer   = VK_NULL_HANDLE;
+    VkBuffer   m_PoolBuffer    = VK_NULL_HANDLE;
+    VkDeviceSize m_IndexBytes  = 0;
+    VkDeviceSize m_PoolBytes   = 0;
 
-    // Residency snapshot — updated only via SetSDF().
-    VkImageView m_SdfView   = VK_NULL_HANDLE;
-    VkSampler   m_SdfSampler= VK_NULL_HANDLE;
-    glm::vec3   m_AabbMin   = glm::vec3(0.0f);
-    glm::vec3   m_AabbMax   = glm::vec3(1.0f);
-    float       m_MaxDist   = 1.0f;
-    bool        m_HasSDF    = false;
-
-    // Per-frame algo UBO (host-visible coherent — matches PCFShadow's pattern).
-    // 64 bytes — well under the 256-byte budget; lighting_sdfcone reads it at
-    // set=2 binding=1.
-    struct AlgoUbo {
-        glm::vec4 SunDirAndHalfAngle;   // xyz = direction TOWARD sun, w = half-angle (rad)
-        glm::vec4 AABBMinAndMaxDist;    // xyz = AABB min, w = R16_SNORM decode scale
-        glm::vec4 AABBMaxAndSurfaceOff; // xyz = AABB max, w = surface offset (along N)
-        glm::vec4 TraceParams;          // x = maxSteps, y = maxDist, z = minStep, w = strength
-        glm::vec4 Flags;                // x = enabled, y = hasSDF, z = padding, w = padding
+    // SparseParams UBO contents (mirrors SparseSDFParams in sdf_sparse.glsl).
+    // Refreshed by UpdateSparseParamsUbo on residency change.
+    struct SparseParams {
+        glm::vec4  AABBMin;   // xyz + MaxDist in .w
+        glm::vec4  AABBMax;   // xyz + decodeScale in .w
+        glm::uvec4 Dims;      // x=Resolution y=BrickSize z=BrickGrid w=log2(BrickSize)
     };
-    static_assert(sizeof(AlgoUbo) == 80, "SDFConeShadow AlgoUbo pinned at 80 bytes");
+    static_assert(sizeof(SparseParams) == 48, "SDFCone SparseParams pinned 48 bytes");
+    SparseParams m_SparseParams{};
+
+    // Dummy SSBOs (one 4-byte each) bound when no sparse SDF is resident, so
+    // descriptor writes never see VK_NULL_HANDLE storage buffers. The shader
+    // never reads them because hasSDF=false short-circuits the trace.
+    VkBuffer        m_DummyBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory  m_DummyMemory = VK_NULL_HANDLE;
+
+    // Per-frame AlgoUbo (host-visible coherent — matches PCFShadow's pattern).
+    struct AlgoUbo {
+        glm::vec4 SunDirAndHalfAngle;     // xyz = direction TOWARD sun, w = half-angle (rad)
+        glm::vec4 TraceParamsAndSurfOff;  // x = maxSteps, y = maxDistance, z = minStep, w = surfaceOffset
+        glm::vec4 StrengthAndFlags;       // x = strength, y = enabled, z = hasSDF, w = 0
+    };
+    static_assert(sizeof(AlgoUbo) == 48, "SDFConeShadow AlgoUbo pinned at 48 bytes");
 
     std::array<VkBuffer,       VulkanContext::kFramesInFlight> m_AlgoUboBuffers{};
     std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> m_AlgoUboMemory{};
     std::array<void*,          VulkanContext::kFramesInFlight> m_AlgoUboMapped{};
 
-    // Per-instance inverse-model SSBO ring (one slot per frame-in-flight).
-    // Owned by InstanceXformBuffer in Main.cpp; we only hold the handles for
-    // descriptor writes. m_XformBytes is the per-slot size.
+    // Per-frame SparseParams UBO (host-visible coherent). Updated on SetSDF().
+    std::array<VkBuffer,       VulkanContext::kFramesInFlight> m_SparseUboBuffers{};
+    std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> m_SparseUboMemory{};
+    std::array<void*,          VulkanContext::kFramesInFlight> m_SparseUboMapped{};
+
+    // Per-instance inverse-model SSBO ring (owned by Main.cpp).
     std::array<VkBuffer, VulkanContext::kFramesInFlight> m_InstXformBuffers{};
     VkDeviceSize                                         m_XformBytes = 0;
 

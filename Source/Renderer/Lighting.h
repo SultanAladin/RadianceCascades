@@ -78,6 +78,14 @@ void LightingPassRecord(LightingPass& lp, const VulkanContext& ctx,
                         float sunIntensity,
                         float ambient,
                         bool  iblEnabled,
-                        float iblIntensity);
+                        float iblIntensity,
+                        bool  realisticPbr = true);
+
+// PBR flag bits packed into LightingPushConstants::IblParams.w (as float bits).
+// Kept here so Main.cpp / panels can build the word without including the
+// shader-side include.
+namespace PbrFlags {
+    constexpr uint32_t Realistic = 1u << 0;
+}
 
 } // namespace RS

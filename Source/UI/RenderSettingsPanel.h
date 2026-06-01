@@ -7,8 +7,16 @@
 namespace RS {
 
 struct RenderSettings;
+struct SkySettings;
 struct IGIAlgorithm;
 
-int DrawRenderSettingsPanel(RenderSettings& settings, IGIAlgorithm* activeGI);
+// Render Settings — PBR + GI knobs. `sky` is kept in the signature for source
+// compatibility; atmosphere lives in its own panel now (see DrawAtmospherePanel).
+int DrawRenderSettingsPanel(RenderSettings& settings, IGIAlgorithm* activeGI,
+                            SkySettings* sky = nullptr);
+
+// Standalone Hillaire 2020 atmosphere panel — Rayleigh / Mie / Ozone / radii /
+// MieG / camera altitude / aerial-perspective bake toggle.
+void DrawAtmospherePanel(SkySettings& sky);
 
 } // namespace RS

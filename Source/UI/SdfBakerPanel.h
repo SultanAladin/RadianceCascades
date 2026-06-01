@@ -36,13 +36,17 @@ struct SdfBakerState {
     int      ResolutionChoice = 1;   // index into kResolutions = {32, 64, 96, 128}
     int      AlgorithmChoice  = 0;   // 0 = Exact BVH (only enabled option)
     int      VizModeChoice    = 0;   // see SDFVizMode (0..4)
+    int      SliceSourceChoice= 0;   // Phase 15f: 0 = Dense .rsdf, 1 = Sparse .rsdfvdb
     bool     ShowSlicePreview = true;
     float    SlicePlaneY01    = 0.5f; // 0..1 across the SDF AABB
 
     // Sparse (VDB-style) storage. When enabled, after the dense bake the panel
     // also builds a BakedSparseSDF and saves it as <name>_<res>_b<brick>.rsdfvdb.
     // The dense .rsdf is still written so existing consumers keep working.
-    bool     UseSparse        = false;
+    // Phase 15g — default flipped to true. Sparse is now the primary path; the
+    // 4 legacy .rsdf files in Cache/SDF/ are still load-supported (boot
+    // auto-load falls back to dense when no .rsdfvdb exists for the resolution).
+    bool     UseSparse        = true;
     int      BrickSizeChoice  = 1;   // index into {4, 8, 16}
 
     // Per-mesh state. Phase 12 only has ShaderBall so a flat vector is plenty.
@@ -61,6 +65,10 @@ struct SdfBakerState {
     std::shared_ptr<BakeProgress> Progress;            // shared with worker
     std::thread                   Worker;
     std::shared_ptr<BakedSDF>     PendingUpload;       // worker writes, main reads
+    // Phase 15a: set instead of PendingUpload when UseSparse was true at
+    // KickBake time. Worker calls MeshSDFBakerBakeSparse directly into this,
+    // skipping the dense allocation entirely.
+    std::shared_ptr<BakedSparseSDF> PendingUploadSparse;
     std::atomic<bool>             WorkerDone { false };
 
     // CPU slice preview (regenerated when the slider moves or a fresh bake

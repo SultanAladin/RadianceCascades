@@ -45,6 +45,14 @@ enum class SDFVizMode : int {
     GradientMag= 4,   // central-difference |∇SDF|, deviation from 1.0
 };
 
+// Phase 15f — slice can read from either the dense .rsdf 3D texture (legacy)
+// or the sparse .rsdfvdb SSBOs. The two sources have independent AABBs so the
+// panel picks whichever residency is present for that mesh.
+enum class SDFSliceSource : int {
+    Dense  = 0,
+    Sparse = 1,
+};
+
 struct SDFSliceState {
     VkImageView View      = VK_NULL_HANDLE;  // resident image view (or dummy)
     VkSampler   Sampler   = VK_NULL_HANDLE;  // GlobalSDF::Sampler
@@ -54,6 +62,16 @@ struct SDFSliceState {
     float       PlaneY    = 0.0f;            // world-space Y for the slice plane
     SDFVizMode  VizMode   = SDFVizMode::SignedRGB;
     bool        HasSDF    = false;
+
+    // Phase 15f sparse-side mirror. Independent AABB because the sparse bake
+    // may have different padding than the legacy dense one.
+    SDFSliceSource Source         = SDFSliceSource::Dense;
+    glm::vec3      SparseAABBMin  = glm::vec3(0.0f);
+    glm::vec3      SparseAABBMax  = glm::vec3(1.0f);
+    float          SparseMaxDist  = 1.0f;
+    uint32_t       SparseRes      = 0;
+    uint32_t       SparseBrickSz  = 0;
+    uint32_t       SparseBrickGrid= 0;
 };
 
 // Procedural matcap settings — driven entirely from the Matcap ImGui panel.
@@ -102,11 +120,18 @@ struct GBufferPreviewPass {
     std::array<VkDescriptorSet, VulkanContext::kFramesInFlight> FrameSets{};
     std::vector<VkFramebuffer> Framebuffers;
 
-    // Phase 12: per-frame UBO carrying SDF-slice params (32 bytes). Host-
-    // visible coherent so we can memcpy from the main thread before recording.
+    // Phase 12: per-frame UBO carrying SDF-slice params (now 96 bytes after
+    // Phase 15f added sparse AABB + Dims). Host-visible coherent so we can
+    // memcpy from the main thread before recording.
     std::array<VkBuffer,       VulkanContext::kFramesInFlight> SdfUboBuffers{};
     std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> SdfUboMemory{};
     std::array<void*,          VulkanContext::kFramesInFlight> SdfUboMapped{};
+
+    // Phase 15f: dummy 16-byte device-local SSBO bound to bindings 13/14 when
+    // no sparse residency exists. Always-bound layout keeps the descriptor set
+    // validation-clean even before the first sparse bake.
+    VkBuffer       DummySparseBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory DummySparseMemory = VK_NULL_HANDLE;
     bool                  Initialized       = false;
 };
 
@@ -123,6 +148,14 @@ void GBufferPreviewTerminate (GBufferPreviewPass& pp, const VulkanContext& ctx);
 // startup after the GlobalSDF residency is established.
 void GBufferPreviewSetSDF(GBufferPreviewPass& pp, const VulkanContext& ctx,
                           VkImageView view, VkSampler sampler);
+
+// Phase 15f: update the sparse SDF SSBO bindings (set=0 bindings 13+14). Pass
+// VK_NULL_HANDLE buffers to revert to the always-bound dummy. Safe to call
+// after vkDeviceWaitIdle (the residency-changed branch already gates the
+// caller on that).
+void GBufferPreviewSetSparseSDF(GBufferPreviewPass& pp, const VulkanContext& ctx,
+                                VkBuffer indexBuffer, VkDeviceSize indexBytes,
+                                VkBuffer poolBuffer,  VkDeviceSize poolBytes);
 
 void GBufferPreviewRecord(GBufferPreviewPass& pp, const VulkanContext& ctx,
                           VkCommandBuffer cmd, uint32_t imageIndex,

@@ -124,6 +124,8 @@ bool OffscreenTargetsInitialize(OffscreenTargets& ot, const VulkanContext& ctx) 
                              kColorSampled, VK_IMAGE_ASPECT_COLOR_BIT, f.RoughMetalF0) &&
             CreateAttachment(ctx, ot.Extent, OffscreenFormatEmissive(),
                              kColorSampled, VK_IMAGE_ASPECT_COLOR_BIT, f.Emissive)     &&
+            CreateAttachment(ctx, ot.Extent, OffscreenFormatSpecular(),
+                             kColorSampled, VK_IMAGE_ASPECT_COLOR_BIT, f.Specular)     &&
             CreateAttachment(ctx, ot.Extent, OffscreenFormatDepth   (),
                              kDepthSampled, VK_IMAGE_ASPECT_DEPTH_BIT, f.Depth)        &&
             CreateAttachment(ctx, ot.Extent, OffscreenFormatIdentity(),
@@ -158,6 +160,7 @@ void OffscreenTargetsTerminate(OffscreenTargets& ot, const VulkanContext& ctx) {
         DestroyAttachment(ctx.Device, f.Normal);
         DestroyAttachment(ctx.Device, f.RoughMetalF0);
         DestroyAttachment(ctx.Device, f.Emissive);
+        DestroyAttachment(ctx.Device, f.Specular);
         DestroyAttachment(ctx.Device, f.Depth);
         DestroyAttachment(ctx.Device, f.Identity);
         DestroyAttachment(ctx.Device, f.LightHDR);
