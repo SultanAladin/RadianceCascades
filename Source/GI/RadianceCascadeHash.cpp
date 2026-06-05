@@ -284,6 +284,29 @@ void RadianceCascadeHashClearForFrame(const RadianceCascadeHash& h,
     if (!h.Initialized) return;
     const VkDeviceSize keyBytes      =
         static_cast<VkDeviceSize>(h.SlotCount) * sizeof(uint32_t);
+
+    // The relight dispatch recorded just before this still READS KeyBuffer +
+    // CellList. Without a compute→transfer barrier the fills below can overlap
+    // it, zeroing keys mid-slot-search — relight threads then bail at the
+    // empty sentinel and never write radiance (GI stays black).
+    {
+        VkBufferMemoryBarrier pre[2]{};
+        pre[0].sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        pre[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        pre[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pre[0].buffer = h.KeyBuffer;
+        pre[0].offset = 0;
+        pre[0].size   = VK_WHOLE_SIZE;
+        pre[1] = pre[0];
+        pre[1].buffer = h.CellListBuffer;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 2, pre, 0, nullptr);
+    }
+
     // CellList[0] = counter; clear just the counter slot (4 bytes). The
     // remaining slots are overwritten by atomic appends and the relight
     // shader only reads up to `count`, so leftover stale keys are inert.
@@ -305,6 +328,28 @@ void RadianceCascadeHashClearForFrame(const RadianceCascadeHash& h,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 0, nullptr, 2, b, 0, nullptr);
+}
+
+void RadianceCascadeHashClearPayload(const RadianceCascadeHash& h,
+                                     VkCommandBuffer cmd) {
+    if (!h.Initialized) return;
+    const VkDeviceSize payloadBytes =
+        static_cast<VkDeviceSize>(h.SlotCount) *
+        static_cast<VkDeviceSize>(RadianceCascadeHash::kBytesPerPayload);
+    vkCmdFillBuffer(cmd, h.PayloadBuffer, 0, payloadBytes, 0u);
+
+    VkBufferMemoryBarrier b{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+    b.srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask       = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.buffer = h.PayloadBuffer;
+    b.offset = 0;
+    b.size   = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 1, &b, 0, nullptr);
 }
 
 void RadianceCascadeHashRecordReadback(const RadianceCascadeHash& h,

@@ -823,6 +823,21 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         }
         RS::InstanceXformBufferRefresh(instanceXforms, frame.FrameSlot, scene,
                                        activeSdfMesh, sdfAnchorInstance);
+
+        // GI relight traces probes (world metres) against the SDF, whose AABB +
+        // brick grid live in mesh-local (cm) space. Push the SDF mesh instance's
+        // model matrix so the relight shader maps probes into local before
+        // tracing — without this every probe ray lands outside the local AABB,
+        // misses, and the SH payload stays zero (black irradiance, no GI).
+        if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
+            glm::mat4 sdfMeshToWorld(1.0f);
+            const RS::InstanceRegistry& reg = RS::SceneInstances(scene);
+            reg.ForEach([&](RS::InstanceHandle, const RS::GpuInstance& inst) {
+                if (inst.Mesh == activeSdfMesh) sdfMeshToWorld = inst.Transform;
+            });
+            rcgi->SetSDFWorldTransform(sdfMeshToWorld);
+        }
+
         RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
         shadow->RecordShadowPass(frame.Cmd, frameCtx);
         RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);

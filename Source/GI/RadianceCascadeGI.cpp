@@ -106,6 +106,16 @@ void RadianceCascadeGI::SetSDFView(const ResidentSparseSDF* sparse, bool hasSDF)
     }
 }
 
+void RadianceCascadeGI::SetSDFWorldTransform(const glm::mat4& meshLocalToWorld) {
+    // Store the inverse (world→local). Guard against a singular/zero matrix
+    // (e.g. a not-yet-populated instance transform) by falling back to identity
+    // — better a world-space trace that mostly misses than NaNs in the SH.
+    const float det = glm::determinant(meshLocalToWorld);
+    m_WorldToLocal = (glm::abs(det) > 1e-12f)
+                         ? glm::inverse(meshLocalToWorld)
+                         : glm::mat4(1.0f);
+}
+
 void RadianceCascadeGI::Initialize(const VulkanContext& ctx, const GlobalSDF& sdf) {
     m_Ctx       = &ctx;
     m_GlobalSdf = &sdf;
@@ -606,7 +616,7 @@ namespace {
 void FillParams(RcHashParams& p, const RadianceCascadeHash& h,
                 const FrameContext& frame, const GISettings& gi,
                 const glm::vec3& aabbMin, const glm::vec3& aabbMax,
-                float decodeScale) {
+                float decodeScale, const glm::mat4& worldToLocal) {
     p.EyePosAndHashLog2 = glm::vec4(frame.Cam.EyePositionWorld, float(h.HashLog2));
     p.SunDirAndIntensity = glm::vec4(glm::normalize(frame.SunDirection), frame.SunIntensity);
     p.SunColor          = glm::vec4(frame.SunColor, 0.20f);     // .w = ambient luma
@@ -628,7 +638,20 @@ void FillParams(RcHashParams& p, const RadianceCascadeHash& h,
     );
     p.SdfAabbMin = glm::vec4(aabbMin, 0.0f);
     p.SdfAabbMax = glm::vec4(aabbMax, decodeScale);
-    p.SecondaryParams = glm::vec4(3.0f, 1.0f, float(frame.FrameIndex), 0.0f);
+
+    // scaleLocalPerWorld = local units per world metre = length of a world-unit
+    // basis vector after the world→local rotation+scale. Matches the cone
+    // shadow's length(mat3(invModel) * L). Cm-local ShaderBall → ~100.
+    const float scaleLocalPerWorld =
+        glm::length(glm::vec3(worldToLocal[0]));   // column 0 length
+    p.SecondaryParams = glm::vec4(3.0f, 1.0f, float(frame.FrameIndex),
+                                  scaleLocalPerWorld > 1e-6f ? scaleLocalPerWorld : 1.0f);
+
+    // Column-major packing — shader rebuilds mat4(c0,c1,c2,c3).
+    p.WorldToLocal0 = worldToLocal[0];
+    p.WorldToLocal1 = worldToLocal[1];
+    p.WorldToLocal2 = worldToLocal[2];
+    p.WorldToLocal3 = worldToLocal[3];
 }
 
 void BufferBarrier(VkCommandBuffer cmd, VkBuffer buf,
@@ -648,9 +671,18 @@ void RadianceCascadeGI::RecordPreFrame(VkCommandBuffer cmd, const FrameContext& 
     if (!m_Hash.Initialized || !m_InsertPipeline || !m_Settings) return;
     if (!m_Settings->Enabled) return;
 
+    // 0) One-shot payload zero. Device-local SSBO contents are undefined at
+    //    init, and rc_insert no longer zeroes per-claim (that wiped relight's
+    //    radiance every frame). Clear exactly once, before the first relight.
+    if (!m_PayloadCleared) {
+        RadianceCascadeHashClearPayload(m_Hash, cmd);
+        m_PayloadCleared = true;
+    }
+
     // 1) Refresh params UBO for this slot.
     RcHashParams params{};
-    FillParams(params, m_Hash, frame, *m_Settings, m_AabbMin, m_AabbMax, m_MaxDist);
+    FillParams(params, m_Hash, frame, *m_Settings, m_AabbMin, m_AabbMax, m_MaxDist,
+               m_WorldToLocal);
     RadianceCascadeHashWriteParams(m_Hash, frame.FrameSlot, params);
 
     // 2) Relight first (consume LAST frame's hash + payload). On frame 0 the

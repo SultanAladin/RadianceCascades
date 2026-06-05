@@ -47,6 +47,14 @@ public:
     // to bind dummies (GI degrades to sky/escape only).
     void SetSDFView(const ResidentSparseSDF* sparse, bool hasSDF);
 
+    // Phase 14b GI fix: the relight pass traces probes (world-space metres)
+    // against the SDF, whose AABB + brick grid are authored in mesh-local
+    // (OBJ) space. Push the SDF mesh's world→local transform — inverse of the
+    // anchor instance's model matrix — so relight can map probes into local
+    // before tracing, mirroring lighting_sdfcone's per-pixel invModel mapping.
+    // Pass identity (the default) when no SDF instance is live.
+    void SetSDFWorldTransform(const glm::mat4& meshLocalToWorld);
+
     void Initialize(const VulkanContext& ctx, const GlobalSDF& sdf) override;
     void Terminate() override;
 
@@ -132,11 +140,17 @@ private:
     static_assert(sizeof(SparseParams) == 48, "RC SparseParams pinned 48 bytes");
     SparseParams m_SparseParams{};
 
+    // World→mesh-local transform for the relight SDF trace (inverse of the SDF
+    // instance's model matrix). Identity when no SDF instance is live, which
+    // is correct when the bake AABB is already world-space.
+    glm::mat4 m_WorldToLocal = glm::mat4(1.0f);
+
     // Phase 14c: tracks which Readback slot was most recently submitted, so
     // DrawImGuiParams reads from the slot whose copy has actually been GPU-
     // completed by the time ImGui runs.
     uint32_t    m_LastReadbackSlot = 0;
     bool        m_HasReadback      = false;
+    bool        m_PayloadCleared   = false;   // one-shot payload zero recorded
 };
 
 } // namespace RS

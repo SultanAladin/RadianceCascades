@@ -64,10 +64,21 @@ struct RcHashParams {
     glm::vec4 SecondaryParams;       // x = secondary radius L0 (cells),
                                      // y = grow per cascade,
                                      // z = frameIndex (for jitter),
-                                     // w = unused
+                                     // w = scaleLocalPerWorld (mesh-local units
+                                     //     per world metre — matches the cone
+                                     //     shadow's length(mat3(invModel)*L)).
+    // World→mesh-local transform for the relight SDF trace. The SDF AABB +
+    // brick grid live in mesh-local (OBJ) space (cm for ShaderBall); probe
+    // positions are world-space metres. Relight maps probePos/dir into local
+    // with this before tracing, exactly as lighting_sdfcone does per-pixel.
+    // Packed column-major as 4 vec4s; shader rebuilds mat4(c0,c1,c2,c3).
+    glm::vec4 WorldToLocal0;
+    glm::vec4 WorldToLocal1;
+    glm::vec4 WorldToLocal2;
+    glm::vec4 WorldToLocal3;
 };
-static_assert(sizeof(RcHashParams) == 12 * 16,
-              "RcHashParams pinned at 192 bytes — mirror in rc_hash.glsl");
+static_assert(sizeof(RcHashParams) == 16 * 16,
+              "RcHashParams pinned at 256 bytes — mirror in rc_hash.glsl");
 
 struct RadianceCascadeHash {
     static constexpr uint32_t kMaxHashLog2     = 22;    // upper bound for sizing
@@ -127,6 +138,13 @@ void RadianceCascadeHashWriteParams(RadianceCascadeHash& h,
 // frame.
 void RadianceCascadeHashClearForFrame(const RadianceCascadeHash& h,
                                       VkCommandBuffer cmd);
+
+// One-shot payload zero (device-local SSBO has undefined initial contents).
+// Recorded once on the first GI frame — per-frame payload clears are forbidden:
+// the radiance written by relight must survive the insert pass's fresh claims
+// or compose only ever sees zeros.
+void RadianceCascadeHashClearPayload(const RadianceCascadeHash& h,
+                                     VkCommandBuffer cmd);
 
 // Phase 14c: copy CellList[0] (occupied probe counter) into ReadbackBuffers[slot]
 // for host-side stats. Records a compute->transfer barrier on CellListBuffer

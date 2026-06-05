@@ -116,11 +116,25 @@ void main() {
     float s0   = gRC_P.CascadeParams.x;
     vec3 probePos = RC_CellCenterWorld(cell, eye, s0, cascade);
 
+    // World→mesh-local transform. The SDF AABB + brick grid are authored in
+    // OBJ-local space (cm for ShaderBall); probePos is world-space metres. We
+    // trace entirely in local space — mirrors lighting_sdfcone.comp's per-pixel
+    // invModel mapping — then map hit/miss endpoints back to world for the SH.
+    mat4 worldToLocal = mat4(gRC_P.WorldToLocal0,
+                             gRC_P.WorldToLocal1,
+                             gRC_P.WorldToLocal2,
+                             gRC_P.WorldToLocal3);
+    float scaleLocalPerWorld = max(gRC_P.SecondaryParams.w, 1e-6);
+    float localPerWorldInv   = 1.0 / scaleLocalPerWorld;   // world metres / local unit
+    vec3 probePosLocal = (worldToLocal * vec4(probePos, 1.0)).xyz;
+
     int rayCount = int(gRC_P.CascadeParams.z);
     rayCount = clamp(rayCount, 4, 64);
 
     float cellPitch = RC_CellPitch(s0, cascade);
     float maxDist   = max(pc.MaxDistance, cellPitch * 4.0);
+    // Trace budgets are world-unit tunables; remap onto the local-space trace.
+    float maxDistLocal = maxDist * scaleLocalPerWorld;
 
     uint jitter = uint(gRC_P.SecondaryParams.z) ^ key;
     float jitterX = float(RC_HashWord(jitter)) * 2.3283064365386963e-10;
@@ -132,7 +146,9 @@ void main() {
     float sunLuma      = dot(sunColor * sunIntensity, vec3(0.2126, 0.7152, 0.0722));
     float ambientLuma  = gRC_P.SunColor.w;
 
-    float tMin = max(cellPitch * 0.05, 0.005);
+    float tMinWorld = max(cellPitch * 0.05, 0.005);
+    float tMinLocal = tMinWorld * scaleLocalPerWorld;
+    float minStepLocal = max(pc.MinStep * scaleLocalPerWorld, 1e-4);
 
     vec4 shAccum = vec4(0.0);
     float weightSum = 0.0;
@@ -141,33 +157,45 @@ void main() {
         vec2 xi = RC_Hammersley(uint(i), uint(rayCount));
         xi.x = fract(xi.x + jitterX);
         xi.y = fract(xi.y + jitterY);
-        vec3 dir = RC_SphereDir(xi);
+        vec3 dirWorld = RC_SphereDir(xi);
 
-        // Trace into sparse SDF. The SparseSDFParams AABB lives in the SDF's
-        // local frame; for Phase 14b/15e we pretend probe world == mesh-local
-        // (multi-mesh + per-instance invModel transform lands in Phase 16).
-        vec3 outPos, outNormal;
+        // Rotate the ray into mesh-local space and renormalize. mat3(worldToLocal)
+        // carries the inverse-model rotation+scale; we trace with a unit local
+        // direction so the SDF's IQ distances stay in local units.
+        vec3 dirLocal = normalize(mat3(worldToLocal) * dirWorld);
+
+        // Sun direction toward light, in local space (for NdotL + cone shadow).
+        vec3 sunDirLocal = normalize(mat3(worldToLocal) * sunDir);
+
+        vec3 outPosLocal, outNormalLocal;
         float outDist;
-        bool hit = SDF_TraceHitSparse(probePos, dir, tMin, maxDist,
-                                      int(pc.MaxSteps), pc.MinStep,
+        bool hit = SDF_TraceHitSparse(probePosLocal, dirLocal,
+                                      tMinLocal, maxDistLocal,
+                                      int(pc.MaxSteps), minStepLocal,
                                       uSparseP.P,
-                                      outPos, outNormal, outDist);
+                                      outPosLocal, outNormalLocal, outDist);
 
         float radianceLuma = 0.0;
         if (hit) {
-            float NdotL = max(dot(outNormal, sunDir), 0.0);
-            float vis = SDF_SoftShadowSparse(outPos, sunDir,
-                                             maxDist, 32.0,
-                                             int(pc.MaxSteps), pc.MinStep,
+            // Normal from the SDF gradient is already in local space; for a
+            // dot against the local sun dir that's consistent (rotation only
+            // affects both equally). Soft shadow traces in local too.
+            float NdotL = max(dot(outNormalLocal, sunDirLocal), 0.0);
+            float vis = SDF_SoftShadowSparse(outPosLocal, sunDirLocal,
+                                             maxDistLocal, 32.0,
+                                             int(pc.MaxSteps), minStepLocal,
                                              uSparseP.P);
             radianceLuma = sunLuma * NdotL * vis + ambientLuma;
         } else {
-            vec4 nextSh = RC_FetchNextCascadeSh(outPos, cascade);
+            // Miss — endpoint is local; map back to world for the next-cascade
+            // SH lookup, which is keyed in world-space cells (insert uses world).
+            vec3 outPosWorld = probePos + dirWorld * (outDist * localPerWorldInv);
+            vec4 nextSh = RC_FetchNextCascadeSh(outPosWorld, cascade);
             radianceLuma = max(nextSh.x * 3.14159265 * kSH_Y00, 0.0);
-            radianceLuma += max(dir.y, 0.0) * ambientLuma * 0.5;
+            radianceLuma += max(dirWorld.y, 0.0) * ambientLuma * 0.5;
         }
 
-        shAccum += RC_ProjectShL1(dir, radianceLuma);
+        shAccum += RC_ProjectShL1(dirWorld, radianceLuma);
         weightSum += 1.0;
     }
 

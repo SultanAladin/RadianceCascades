@@ -57,8 +57,14 @@ bool RC_Insert(uint key) {
         uint expected = 0u;
         uint old = atomicCompSwap(gRC_Keys[slot], expected, key);
         if (old == 0u) {
-            // First-time insert: clear payload, append to cell list.
-            gRC_Payload[slot] = vec4(0.0);
+            // First-time insert: append to cell list. Do NOT zero the payload —
+            // the key table is cleared every frame, so every insert is "fresh",
+            // and zeroing here wipes the radiance the relight pass wrote during
+            // PreFrame before compose ever reads it (= permanently black GI).
+            // The payload persists across frames keyed by slot (SHaRC-style);
+            // the host clears it ONCE at startup. A slot reused by a different
+            // key briefly inherits stale radiance and converges via the 0.25
+            // temporal blend in rc_relight.
             uint listIdx = atomicAdd(gRC_CellList[0], 1u);
             // CellList[1..N] is the storage area; cap at N to avoid overflow.
             if (listIdx + 1u < gRC_CellList.length()) {

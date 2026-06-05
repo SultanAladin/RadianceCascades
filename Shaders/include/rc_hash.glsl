@@ -33,7 +33,12 @@ struct RcParams {
     vec4 RenderExtentAndFlags;
     vec4 SdfAabbMin;
     vec4 SdfAabbMax;          // .w = decode scale
-    vec4 SecondaryParams;     // x=radiusL0, y=growPerCascade, z=frameIdx, w=_
+    vec4 SecondaryParams;     // x=radiusL0, y=growPerCascade, z=frameIdx,
+                              // w=scaleLocalPerWorld (local units / world metre)
+    vec4 WorldToLocal0;       // world→mesh-local transform (column-major).
+    vec4 WorldToLocal1;       // Relight maps probePos/dir into the SDF's local
+    vec4 WorldToLocal2;       // frame before tracing (AABB lives in local cm).
+    vec4 WorldToLocal3;
 };
 
 // ---------------------------------------------------------------------------
