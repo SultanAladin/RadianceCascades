@@ -221,13 +221,23 @@ float SDF_SoftShadowSparse(vec3 ro, vec3 rd,                                    
     float res = 1.0;                                                              \
     for (int i = 0; i < maxSteps; ++i) {                                          \
         if (t > maxDist) break;                                                   \
-        float h = SDFSparseRaySampleHelper(ro + rd * t, rd, params);              \
-        if (h >= 1e5) {                                                           \
+        vec3 p = ro + rd * t;                                                     \
+        /* Ray helper gives the brick-skip step distance: for an AllOutside     */\
+        /* brick it's the slab-exit length (advance fast), for a mixed brick    */\
+        /* it's the true trilinear SDF distance. We MUST advance by this.       */\
+        float hStep = SDFSparseRaySampleHelper(p, rd, params);                    \
+        if (hStep >= 1e5) {                                                       \
             break;                                                                \
         }                                                                         \
-        if (h < 0.001) return 0.0;                                                \
-        res = min(res, k * h / max(t, 1e-4));                                     \
-        t  += max(h, minStep);                                                    \
+        /* But the penumbra term needs the TRUE distance to the nearest surface,*/\
+        /* not the slab-exit length — feeding the slab length into k*h/t draws  */\
+        /* the brick lattice as fake shadow banding. The point helper returns   */\
+        /* +maxDist for AllOutside bricks (= "no occluder"), the right value    */\
+        /* here, and the real trilinear distance inside mixed bricks.           */\
+        float hTrue = SDFSparseSampleHelper(p, params);                          \
+        if (hTrue < 0.001) return 0.0;                                            \
+        res = min(res, k * hTrue / max(t, 1e-4));                                 \
+        t  += max(hStep, minStep);                                               \
     }                                                                             \
     res = clamp(res, 0.0, 1.0);                                                   \
     return res * res * (3.0 - 2.0 * res);                                         \
