@@ -1,0 +1,76 @@
+#version 450
+// Sparse RC — cascade-0 resolve: directional radiance → SH-L1 irradiance basis.
+//
+// After the top-down relight, every cascade-0 texel holds the FULLY MERGED
+// radiance L_{0,∞}(probe, dir) with its β. The paper reconstructs diffuse by
+// integrating cascade 0's directions against the cosine lobe; doing that per
+// pixel would read D0 texels per probe corner (8·D0 per pixel). Instead this
+// pass integrates once per probe into RGB SH-L1 (3 vec4), and compose
+// evaluates the SH at the pixel normal — mathematically the same cosine
+// integral, amortised per probe.
+//
+// Thread = one occupied cascade-0 probe (from CellList[0]).
+//
+// Sets: 0 = RC hash (payload read, resolve write).
+
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "include/rc_hash.glsl"
+
+layout(std430, set = 0, binding = 0) buffer RC_KeyBuf     { uint  gRC_Keys[];     };
+layout(std430, set = 0, binding = 1) buffer RC_PayloadBuf { vec4  gRC_Payload[];  };
+layout(std140, set = 0, binding = 2) uniform RC_ParamsBuf { RcParams gRC_P; };
+layout(std430, set = 0, binding = 3) buffer RC_CellList   { uint  gRC_CellList[]; };
+layout(std430, set = 0, binding = 4) buffer RC_ResolveBuf { vec4  gRC_Resolve[];  };
+
+void main() {
+    uint base = 1u << uint(gRC_P.EyePosAndBaseLog2.w);
+    uint d0   = uint(gRC_P.CascadeParams.z);
+    uint res  = RC_OctRes(0u);
+
+    uint probeIdx = gl_GlobalInvocationID.x;
+    uint count = min(gRC_CellList[0], RC_CascadeSlots(base, 0u));
+    if (probeIdx >= count) return;
+
+    uint key = gRC_CellList[1u + probeIdx];
+    if (key == 0u) return;
+
+    ivec3 cell; uint kc;
+    RC_UnpackKey(key, cell, kc);
+
+    // Locate our slot (cascade 0: keyOffset = 0, payloadOffset = 0).
+    uint mask = RC_CascadeSlots(base, 0u) - 1u;
+    uint slot = RC_HashWord(key) & mask;
+    bool found = false;
+    for (uint p = 0u; p < RC_PROBE_CAP; ++p) {
+        uint stored = gRC_Keys[slot];
+        if (stored == 0u)  break;
+        if (stored == key) { found = true; break; }
+        slot = (slot + 1u) & mask;
+    }
+    if (!found) return;
+
+    uint texBase = slot * d0;
+
+    // Project every direction's merged radiance into per-channel SH-L1.
+    // Solid-angle weight: octahedral texels are near-equal-area, so a uniform
+    // 4π/D0 weight is the standard approximation.
+    vec4 shR = vec4(0.0);
+    vec4 shG = vec4(0.0);
+    vec4 shB = vec4(0.0);
+    float dw = (4.0 * 3.14159265) / float(d0);
+    for (uint ty = 0u; ty < res; ++ty)
+    for (uint tx = 0u; tx < res; ++tx) {
+        vec3 dir = RC_TexelDir(tx, ty, res);
+        vec3 L   = gRC_Payload[texBase + ty * res + tx].rgb;
+        shR += RC_ProjectShL1(dir, L.r) * dw;
+        shG += RC_ProjectShL1(dir, L.g) * dw;
+        shB += RC_ProjectShL1(dir, L.b) * dw;
+    }
+
+    gRC_Resolve[slot * 3u + 0u] = shR;
+    gRC_Resolve[slot * 3u + 1u] = shG;
+    gRC_Resolve[slot * 3u + 2u] = shB;
+}

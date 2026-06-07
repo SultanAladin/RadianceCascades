@@ -30,7 +30,9 @@ struct GISettings {
     // --- Radiance-cascade specific (consumed by RadianceCascadeGI). All
     // values match the defaults in Docs/RadianceCascades3D_OpenWorld.md §5.1.
     int   CascadeCount  = 4;        // c0..c3 by default; up to 6 supported.
-    float S0Meters      = 1.0f;     // c0 probe spacing in metres.
+    float S0Meters      = 0.3f;     // c0 probe spacing in metres. ShaderBall is
+                                    // ~2.7 m world; 0.3 m puts ~9 c0 probes
+                                    // across it so near-field bounce resolves.
     int   R0Rays        = 32;       // c0 rays per probe. Doc note: 16 caused
                                     // banding on curved surfaces in 3D;
                                     // bumped to 32 as the Phase 14a default.

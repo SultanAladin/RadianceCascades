@@ -1,22 +1,28 @@
 #version 450
-// Phase 14b — Radiance Cascade hash relight pass.
-// Phase 15e — sparse SDF: the sampler3D bind point is replaced by a sparse-VDB
-// pair (BrickIndex SSBO + BrickPool SSBO) plus a SparseParams UBO. The hot
-// sphere-trace loop uses the brick-aware ray helper, so cascade rays cross
-// empty space in one step instead of grinding voxel-by-voxel.
+// Sparse RC — per-cascade relight (canonical radiance cascades).
 //
-// One workgroup per occupied cell (sourced from CellList[1..count]). Trace
-// rays into the SDF, sample direct lighting at the hit (sun · NdotL · SDF
-// cone-shadow), or look up the next-cascade SH probe at the miss endpoint
-// (radiance-interval extension, Taichi C4-validated). Accumulate into SH-L1
-// luma (4 bands × 1 channel = 1 vec4) and write to ProbePayload.
+// One dispatch per cascade, host-ordered TOP-DOWN (c = N−1 → 0) with a
+// compute→compute barrier between dispatches, so when cascade c runs, c+1's
+// payload is final and the merge is single-pass (paper §merging: ordering
+// doesn't matter mathematically; top-down lets us store the fully merged
+// radiance L_{t_c,∞} per direction so compose only reads cascade 0).
 //
-// Descriptor sets:
-//   set=0 : Sparse SDF
-//           binding 0 = SparseIdx  SSBO  (uint BrickIndex[BrickGrid^3])
-//           binding 1 = SparsePool SSBO  (uint BrickPool[occupied*bs^3/2])
-//           binding 2 = SparseParams UBO (SparseSDFParams)
-//   set=1 : RcHash (same 4 bindings as rc_insert)
+// Thread = one (probe, direction) texel. pc.Cascade selects the level:
+//   probe   = CellList[c][gid / dirCount]
+//   texel   = gid % dirCount               → fixed octahedral direction
+//   interval = [s0·(2^c − 1), s0·(2^(c+1) − 1))    — disjoint per cascade
+//
+// March the SDF over ONLY this interval:
+//   hit  → radiance = sunRadiance · NdotL · vis · albedo  (β = 0)
+//   miss → β = 1; merge: radiance += trilinear-8(parent probes, same dir,
+//          2×2 oct block average = the paper's "average 4 texels of c+1").
+//          Top cascade or absent parent → sky escape term.
+//
+// Payload texel = vec4(rgb merged radiance, β). No jitter, no temporal blend:
+// directions are fixed per frame, so output is deterministic and noiseless —
+// RC's whole point.
+//
+// Sets: 0 = sparse SDF (idx, pool, params), 1 = RC hash, 2 = instance xforms.
 
 #extension GL_GOOGLE_include_directive : require
 
@@ -36,174 +42,162 @@ SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)
 
 SDFTRACE_DEFINE_SPARSE_HELPERS()
 
-// ----------------------- set=1: RC hash ---------------------------------------
 layout(std430, set = 1, binding = 0) buffer RC_KeyBuf     { uint  gRC_Keys[];     };
 layout(std430, set = 1, binding = 1) buffer RC_PayloadBuf { vec4  gRC_Payload[];  };
 layout(std140, set = 1, binding = 2) uniform RC_ParamsBuf { RcParams gRC_P; };
 layout(std430, set = 1, binding = 3) buffer RC_CellList   { uint  gRC_CellList[]; };
 
-// ----------------------- push constants ---------------------------------------
 layout(push_constant) uniform Push {
-    uint MaxSteps;       // sphere-trace iteration cap
-    float MinStep;       // floor on per-step march to avoid stalls
-    float MaxDistance;   // ray budget in world units
+    uint  Cascade;       // which cascade this dispatch relights
+    uint  MaxSteps;
+    float MinStep;
     uint  _pad0;
 } pc;
 
-// ----------------------- helpers ---------------------------------------------
-
-vec2 RC_Hammersley(uint i, uint N) {
-    uint bits = i;
-    bits = (bits << 16u) | (bits >> 16u);
-    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
-    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
-    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
-    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
-    return vec2(float(i) / float(N), float(bits) * 2.3283064365386963e-10);
-}
-
-vec3 RC_SphereDir(vec2 xi) {
-    float phi   = 6.2831853 * xi.x;
-    float cosT  = 1.0 - 2.0 * xi.y;
-    float sinT  = sqrt(max(0.0, 1.0 - cosT * cosT));
-    return vec3(cos(phi) * sinT, cosT, sin(phi) * sinT);
-}
-
-vec4 RC_FetchNextCascadeSh(vec3 worldPos, uint cascade) {
-    int  cascadeCount = int(gRC_P.CascadeParams.y);
-    uint nextC = min(cascade + 1u, uint(cascadeCount - 1));
-    vec3 eye   = gRC_P.EyePosAndHashLog2.xyz;
-    float s0   = gRC_P.CascadeParams.x;
-
-    ivec3 cell = RC_WorldToCell(worldPos, eye, s0, nextC);
-    uint  key  = RC_PackKey(cell, nextC);
-
-    const uint N = gRC_Keys.length();
-    const uint mask = N - 1u;
-    uint slot = RC_HashWord(key) & mask;
-    for (uint probe = 0u; probe < 8u; ++probe) {
-        uint stored = gRC_Keys[slot];
-        if (stored == 0u)  return vec4(0.0);
-        if (stored == key) return gRC_Payload[slot];
+// Find the payload texel base for (cell, cascade); ~0u if the probe is absent.
+uint RC_FindPayloadBase(ivec3 cell, uint cascade,
+                        uint base, uint d0) {
+    uint slots   = RC_CascadeSlots(base, cascade);
+    uint keyOff  = RC_KeyOffset(base, cascade);
+    uint mask    = slots - 1u;
+    uint key     = RC_PackKey(cell, cascade);
+    uint slot    = RC_HashWord(key) & mask;
+    for (uint p = 0u; p < RC_PROBE_CAP; ++p) {
+        uint stored = gRC_Keys[keyOff + slot];
+        if (stored == 0u)  return ~0u;
+        if (stored == key) {
+            return RC_PayloadOffset(base, d0, cascade)
+                 + slot * RC_DirCount(d0, cascade);
+        }
         slot = (slot + 1u) & mask;
     }
-    return vec4(0.0);
+    return ~0u;
 }
 
-// ----------------------- main ------------------------------------------------
+// Parent merge: trilinear over the 8 surrounding c+1 probes; per probe,
+// average the 2×2 octahedral texel block that maps onto this direction texel
+// (parent res = 2× ours, so our texel (x,y) covers parent (2x..2x+1, 2y..2y+1)).
+vec4 RC_MergeFromParent(vec3 probePos, uint cascade, uint tx, uint ty,
+                        uint base, uint d0, float s0,
+                        vec3 sunColor, float ambient, vec3 fallbackDir) {
+    int cascadeCount = int(gRC_P.CascadeParams.y);
+    if (int(cascade) + 1 >= cascadeCount) {
+        // Top cascade: interval extends conceptually to infinity → sky.
+        return vec4(RC_Sky(fallbackDir, sunColor, ambient), 1.0);
+    }
+    uint pc1     = cascade + 1u;
+    uint pRes    = RC_OctRes(pc1);
+    float pitch  = RC_CellPitch(s0, pc1);
+
+    vec3 rel   = probePos / pitch - vec3(0.5);
+    ivec3 b    = ivec3(floor(rel));
+    vec3 t     = fract(rel);
+
+    vec4 acc = vec4(0.0);
+    float wAcc = 0.0;
+    for (int dz = 0; dz < 2; ++dz)
+    for (int dy = 0; dy < 2; ++dy)
+    for (int dx = 0; dx < 2; ++dx) {
+        uint pBase = RC_FindPayloadBase(b + ivec3(dx, dy, dz), pc1, base, d0);
+        if (pBase == ~0u) continue;
+        vec3 w3 = mix(1.0 - t, t, vec3(float(dx), float(dy), float(dz)));
+        float w = w3.x * w3.y * w3.z;
+
+        vec4 blk = vec4(0.0);
+        for (uint sy = 0u; sy < 2u; ++sy)
+        for (uint sx = 0u; sx < 2u; ++sx) {
+            uint px = 2u * tx + sx;
+            uint py = 2u * ty + sy;
+            blk += gRC_Payload[pBase + py * pRes + px];
+        }
+        acc  += blk * (0.25 * w);
+        wAcc += w;
+    }
+    if (wAcc <= 0.0) {
+        return vec4(RC_Sky(fallbackDir, sunColor, ambient), 1.0);
+    }
+    return acc / wAcc;
+}
 
 void main() {
-    uint cellIdx = gl_GlobalInvocationID.x;
-    uint count   = gRC_CellList[0];
-    if (cellIdx >= count) return;
+    uint base = 1u << uint(gRC_P.EyePosAndBaseLog2.w);
+    uint d0   = uint(gRC_P.CascadeParams.z);
+    uint c    = pc.Cascade;
+    uint dirCount = RC_DirCount(d0, c);
+    uint res      = RC_OctRes(c);
+    uint listOff  = RC_CellListOffset(base, c);
 
-    uint key = gRC_CellList[cellIdx + 1u];
+    uint probeIdx = gl_GlobalInvocationID.x / dirCount;
+    uint texel    = gl_GlobalInvocationID.x % dirCount;
+
+    uint count = min(gRC_CellList[listOff], RC_CascadeSlots(base, c));
+    if (probeIdx >= count) return;
+
+    uint key = gRC_CellList[listOff + 1u + probeIdx];
     if (key == 0u) return;
 
-    const uint N = gRC_Keys.length();
-    const uint mask = N - 1u;
-    uint slot = RC_HashWord(key) & mask;
-    for (uint probe = 0u; probe < 8u; ++probe) {
-        if (gRC_Keys[slot] == key) break;
-        if (gRC_Keys[slot] == 0u)  return;
-        slot = (slot + 1u) & mask;
-    }
+    ivec3 cell; uint kc;
+    RC_UnpackKey(key, cell, kc);
 
-    ivec3 cell; uint cascade;
-    RC_UnpackKey(key, cell, cascade);
+    float s0 = gRC_P.CascadeParams.x;
+    float pitch = RC_CellPitch(s0, c);
+    vec3 probePos = RC_CellCenterWorld(cell, pitch);
 
-    vec3 eye   = gRC_P.EyePosAndHashLog2.xyz;
-    float s0   = gRC_P.CascadeParams.x;
-    vec3 probePos = RC_CellCenterWorld(cell, eye, s0, cascade);
+    uint tx = texel % res;
+    uint ty = texel / res;
+    vec3 dirWorld = RC_TexelDir(tx, ty, res);
 
-    // World→mesh-local transform. The SDF AABB + brick grid are authored in
-    // OBJ-local space (cm for ShaderBall); probePos is world-space metres. We
-    // trace entirely in local space — mirrors lighting_sdfcone.comp's per-pixel
-    // invModel mapping — then map hit/miss endpoints back to world for the SH.
-    mat4 worldToLocal = mat4(gRC_P.WorldToLocal0,
-                             gRC_P.WorldToLocal1,
-                             gRC_P.WorldToLocal2,
-                             gRC_P.WorldToLocal3);
-    float scaleLocalPerWorld = max(gRC_P.SecondaryParams.w, 1e-6);
-    float localPerWorldInv   = 1.0 / scaleLocalPerWorld;   // world metres / local unit
-    vec3 probePosLocal = (worldToLocal * vec4(probePos, 1.0)).xyz;
+    // ---- march the disjoint interval in SDF-local space ---------------------
+    mat4 worldToLocal = mat4(gRC_P.WorldToLocal0, gRC_P.WorldToLocal1,
+                             gRC_P.WorldToLocal2, gRC_P.WorldToLocal3);
+    float lpw = max(gRC_P.MiscParams.y, 1e-6);          // local units / metre
 
-    int rayCount = int(gRC_P.CascadeParams.z);
-    rayCount = clamp(rayCount, 4, 64);
+    float t0 = RC_IntervalStart(s0, c);
+    float t1 = RC_IntervalEnd  (s0, c);
 
-    float cellPitch = RC_CellPitch(s0, cascade);
-    float maxDist   = max(pc.MaxDistance, cellPitch * 4.0);
-    // Trace budgets are world-unit tunables; remap onto the local-space trace.
-    float maxDistLocal = maxDist * scaleLocalPerWorld;
-
-    uint jitter = uint(gRC_P.SecondaryParams.z) ^ key;
-    float jitterX = float(RC_HashWord(jitter)) * 2.3283064365386963e-10;
-    float jitterY = float(RC_HashWord(jitter ^ 0x9E3779B9u)) * 2.3283064365386963e-10;
+    vec3 roLocal  = (worldToLocal * vec4(probePos, 1.0)).xyz;
+    vec3 rdLocal  = normalize(mat3(worldToLocal) * dirWorld);
+    float t0L = t0 * lpw;
+    float t1L = t1 * lpw;
+    float minStepL = max(pc.MinStep * lpw, 1e-4);
 
     vec3  sunDir       = normalize(gRC_P.SunDirAndIntensity.xyz);
-    float sunIntensity = gRC_P.SunDirAndIntensity.w;
-    vec3  sunColor     = gRC_P.SunColor.rgb;
-    float sunLuma      = dot(sunColor * sunIntensity, vec3(0.2126, 0.7152, 0.0722));
-    float ambientLuma  = gRC_P.SunColor.w;
+    vec3  sunRadiance  = gRC_P.SunColor.rgb * gRC_P.SunDirAndIntensity.w;
+    float ambient      = gRC_P.SunColor.w;
+    vec3  sdfAlbedo    = gRC_P.SdfAlbedo.rgb;
+    vec3  sunDirLocal  = normalize(mat3(worldToLocal) * sunDir);
 
-    float tMinWorld = max(cellPitch * 0.05, 0.005);
-    float tMinLocal = tMinWorld * scaleLocalPerWorld;
-    float minStepLocal = max(pc.MinStep * scaleLocalPerWorld, 1e-4);
+    vec3 hitPosL, hitNL;
+    float hitDist;
+    bool hit = SDF_TraceHitSparse(roLocal, rdLocal,
+                                  max(t0L, 1e-4), t1L,
+                                  int(pc.MaxSteps), minStepL,
+                                  uSparseP.P,
+                                  hitPosL, hitNL, hitDist);
+    // Interval start must be respected even when the box-enter skip lands the
+    // march before t0 (SDF_TraceHitSparse clamps to max(tMin, boxEnter)).
+    if (hit && hitDist < t0L) hit = false;
 
-    vec4 shAccum = vec4(0.0);
-    float weightSum = 0.0;
-
-    for (int i = 0; i < rayCount; ++i) {
-        vec2 xi = RC_Hammersley(uint(i), uint(rayCount));
-        xi.x = fract(xi.x + jitterX);
-        xi.y = fract(xi.y + jitterY);
-        vec3 dirWorld = RC_SphereDir(xi);
-
-        // Rotate the ray into mesh-local space and renormalize. mat3(worldToLocal)
-        // carries the inverse-model rotation+scale; we trace with a unit local
-        // direction so the SDF's IQ distances stay in local units.
-        vec3 dirLocal = normalize(mat3(worldToLocal) * dirWorld);
-
-        // Sun direction toward light, in local space (for NdotL + cone shadow).
-        vec3 sunDirLocal = normalize(mat3(worldToLocal) * sunDir);
-
-        vec3 outPosLocal, outNormalLocal;
-        float outDist;
-        bool hit = SDF_TraceHitSparse(probePosLocal, dirLocal,
-                                      tMinLocal, maxDistLocal,
-                                      int(pc.MaxSteps), minStepLocal,
-                                      uSparseP.P,
-                                      outPosLocal, outNormalLocal, outDist);
-
-        float radianceLuma = 0.0;
-        if (hit) {
-            // Normal from the SDF gradient is already in local space; for a
-            // dot against the local sun dir that's consistent (rotation only
-            // affects both equally). Soft shadow traces in local too.
-            float NdotL = max(dot(outNormalLocal, sunDirLocal), 0.0);
-            float vis = SDF_SoftShadowSparse(outPosLocal, sunDirLocal,
-                                             maxDistLocal, 32.0,
-                                             int(pc.MaxSteps), minStepLocal,
-                                             uSparseP.P);
-            radianceLuma = sunLuma * NdotL * vis + ambientLuma;
-        } else {
-            // Miss — endpoint is local; map back to world for the next-cascade
-            // SH lookup, which is keyed in world-space cells (insert uses world).
-            vec3 outPosWorld = probePos + dirWorld * (outDist * localPerWorldInv);
-            vec4 nextSh = RC_FetchNextCascadeSh(outPosWorld, cascade);
-            radianceLuma = max(nextSh.x * 3.14159265 * kSH_Y00, 0.0);
-            radianceLuma += max(dirWorld.y, 0.0) * ambientLuma * 0.5;
-        }
-
-        shAccum += RC_ProjectShL1(dirWorld, radianceLuma);
-        weightSum += 1.0;
+    vec4 result;
+    if (hit) {
+        float NdotL = max(dot(hitNL, sunDirLocal), 0.0);
+        float vis = SDF_SoftShadowSparse(hitPosL + hitNL * minStepL * 4.0,
+                                         sunDirLocal,
+                                         t1L, 32.0,
+                                         int(pc.MaxSteps), minStepL,
+                                         uSparseP.P);
+        vec3 bounce = sunRadiance * (NdotL * vis) * sdfAlbedo
+                    + vec3(ambient * 0.25) * sdfAlbedo;
+        result = vec4(bounce, 0.0);                       // β = 0: occluded
+    } else {
+        // β = 1: interval transparent → merge the parent's [t_{c+1}, ∞).
+        result = RC_MergeFromParent(probePos, c, tx, ty,
+                                    base, d0, s0,
+                                    gRC_P.SunColor.rgb, ambient, dirWorld);
+        // merge operator with near.rgb = 0, near.β = 1 ⇒ result unchanged.
     }
 
-    if (weightSum > 0.0) {
-        shAccum *= (4.0 * 3.14159265) / weightSum;
-    }
-
-    vec4 prev = gRC_Payload[slot];
-    float alpha = 0.25;
-    gRC_Payload[slot] = mix(prev, shAccum, alpha);
+    uint pb = RC_FindPayloadBase(cell, c, base, d0);
+    if (pb == ~0u) return;
+    gRC_Payload[pb + texel] = result;
 }

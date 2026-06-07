@@ -1,18 +1,17 @@
-// Source/GI/RadianceCascadeGI.h — Phase 14b
-// Concrete IGIAlgorithm implementor for the RC × Hash design. Owns:
-//   - RadianceCascadeHash (key + payload + cell-list + params SSBOs)
-//   - rc_insert.comp pipeline (primary + secondary insertion)
-//   - rc_relight.comp pipeline (R0 rays + SH-L1 accumulate)
-//   - gi_compose.comp pipeline (modulate LightHDR after lighting)
+// Source/GI/RadianceCascadeGI.h — sparse radiance cascades (canonical).
+// Concrete IGIAlgorithm implementor. Owns:
+//   - RadianceCascadeHash (keys + payload + cell-lists + resolve + params)
+//   - rc_insert.comp  (screen + eye-volume insertion w/ parent merge chains)
+//   - rc_relight.comp (per-cascade dispatch, disjoint intervals, top-down merge)
+//   - rc_resolve.comp (cascade-0 directional radiance → SH-L1)
+//   - gi_compose.comp (trilinear c0 gather → LightHDR after lighting)
 //
-// Frame ordering inside the host:
-//   RecordPreFrame  → hash clear (KeyBuf + CellList counter) + relight dispatch
-//                     against PREVIOUS frame's hash (so the first frame just
-//                     does nothing useful — fine, irradiance ramps up).
-//   RecordGather    → insert primary + insert secondary, repopulating hash.
-//                     Compose runs separately via BindGIResourceForLighting.
-// The compose dispatch is fired by RadianceCascadeGI::RecordCompose, called
-// from Main.cpp after LightingPassRecord.
+// Frame ordering inside the host (single-frame pipeline, no cross-frame state):
+//   RecordPreFrame → clear this slot's keys + cell-list counters.
+//   RecordGather   → insert, then relight cascades N−1…0 (barrier between
+//                    each so child merges read final parent radiance), then
+//                    resolve c0 to SH.
+//   RecordCompose  → gather + add to LightHDR (called after LightingPassRecord).
 #pragma once
 
 #include "GI/IGIAlgorithm.h"
@@ -55,6 +54,11 @@ public:
     // Pass identity (the default) when no SDF instance is live.
     void SetSDFWorldTransform(const glm::mat4& meshLocalToWorld);
 
+    // Phase 14c: albedo of the SDF mesh, used to tint radiance leaving a probe
+    // hit (so the bounce carries the bouncing surface's colour). Single mesh-
+    // wide tint until per-hit material (GBuffer reprojection / baked bricks).
+    void SetSDFAlbedo(const glm::vec3& albedo) { m_SdfAlbedo = albedo; }
+
     void Initialize(const VulkanContext& ctx, const GlobalSDF& sdf) override;
     void Terminate() override;
 
@@ -77,6 +81,7 @@ public:
 private:
     bool CreateInsertPipeline();
     bool CreateRelightPipeline();
+    bool CreateResolvePipeline();
     bool CreateComposePipeline();
     bool CreateGBufferDescriptors();
     bool CreateSdfDescriptors();
@@ -100,12 +105,16 @@ private:
     VkPipelineLayout      m_InsertLayout   = VK_NULL_HANDLE;
     VkPipeline            m_InsertPipeline = VK_NULL_HANDLE;
 
-    // ---- Relight pipeline (Phase 15e: sparse SDF) ----
+    // ---- Relight pipeline (sparse SDF traced per cascade) ----
     VkDescriptorSetLayout m_RelightSdfSetLayout    = VK_NULL_HANDLE; // set=0
     VkDescriptorPool      m_RelightSdfPool         = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, VulkanContext::kFramesInFlight> m_RelightSdfSets{};
     VkPipelineLayout      m_RelightLayout          = VK_NULL_HANDLE;
     VkPipeline            m_RelightPipeline        = VK_NULL_HANDLE;
+
+    // ---- Resolve pipeline (c0 dirs → SH-L1) ----
+    VkPipelineLayout      m_ResolveLayout          = VK_NULL_HANDLE;
+    VkPipeline            m_ResolvePipeline        = VK_NULL_HANDLE;
 
     // SparseParams UBO ring + dummy buffer for the no-SDF fallback.
     std::array<VkBuffer,       VulkanContext::kFramesInFlight> m_SparseUboBuffers{};
@@ -145,12 +154,14 @@ private:
     // is correct when the bake AABB is already world-space.
     glm::mat4 m_WorldToLocal = glm::mat4(1.0f);
 
+    // SDF mesh albedo for the relight bounce tint (Phase 14c RGB SH).
+    glm::vec3 m_SdfAlbedo = glm::vec3(0.8f);
+
     // Phase 14c: tracks which Readback slot was most recently submitted, so
     // DrawImGuiParams reads from the slot whose copy has actually been GPU-
     // completed by the time ImGui runs.
     uint32_t    m_LastReadbackSlot = 0;
     bool        m_HasReadback      = false;
-    bool        m_PayloadCleared   = false;   // one-shot payload zero recorded
 };
 
 } // namespace RS

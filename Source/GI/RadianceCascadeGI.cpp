@@ -123,9 +123,11 @@ void RadianceCascadeGI::Initialize(const VulkanContext& ctx, const GlobalSDF& sd
     // UBO + dummy SSBO buffers keep bindings valid until SetSDFView lands
     // real residency.
 
-    const int  log2Want = m_Settings ? m_Settings->HashLog2 : 20;
-    const uint32_t log2 = static_cast<uint32_t>(std::max(16, std::min(22, log2Want)));
-    if (!RadianceCascadeHashInitialize(m_Hash, ctx, log2)) {
+    const int  log2Want = m_Settings ? m_Settings->HashLog2 : 14;
+    const uint32_t log2 = static_cast<uint32_t>(std::max(12, std::min(18, log2Want)));
+    const uint32_t cascades =
+        static_cast<uint32_t>(std::max(1, std::min(6, m_Settings ? m_Settings->CascadeCount : 4)));
+    if (!RadianceCascadeHashInitialize(m_Hash, ctx, log2, cascades)) {
         RS_LOG_ERROR("RC GI: hash core init failed");
         return;
     }
@@ -135,9 +137,11 @@ void RadianceCascadeGI::Initialize(const VulkanContext& ctx, const GlobalSDF& sd
     if (!CreateLightHdrDescriptors())return;
     if (!CreateInsertPipeline())     return;
     if (!CreateRelightPipeline())    return;
+    if (!CreateResolvePipeline())    return;
     if (!CreateComposePipeline())    return;
 
-    RS_LOG_INFO("RadianceCascadeGI initialized: hash 2^%u", m_Hash.HashLog2);
+    RS_LOG_INFO("RadianceCascadeGI initialized: base 2^%u, %u cascades",
+                m_Hash.BaseLog2, m_Hash.Cascades);
 }
 
 void RadianceCascadeGI::Terminate() {
@@ -151,6 +155,7 @@ void RadianceCascadeGI::Terminate() {
     };
     destroyPipeline(m_InsertPipeline,  m_InsertLayout);
     destroyPipeline(m_RelightPipeline, m_RelightLayout);
+    destroyPipeline(m_ResolvePipeline, m_ResolveLayout);
     destroyPipeline(m_ComposePipeline, m_ComposeLayout);
 
     if (m_InsertGBufferPool)  vkDestroyDescriptorPool     (m_Ctx->Device, m_InsertGBufferPool, nullptr);
@@ -198,11 +203,10 @@ void RadianceCascadeGI::DrawImGuiParams() {
 
     ImGui::SliderInt  ("Cascades",     &s.CascadeCount, 1, 6);
     ImGui::SliderFloat("s0 (m)",       &s.S0Meters,     0.25f, 4.0f, "%.2f");
-    ImGui::SliderInt  ("r0 (rays/c0)", &s.R0Rays,       8, 64);
-    ImGui::SliderInt  ("Hash log2",    &s.HashLog2,     16, 22);
-    ImGui::Checkbox   ("Bilinear fix", &s.BilinearFix);
+    ImGui::Checkbox   ("Trilinear gather", &s.BilinearFix);
     ImGui::SliderFloat("Indirect boost", &s.IndirectBoost, 0.0f, 4.0f, "%.2f");
-    ImGui::TextDisabled("Hash log2 changes apply on algo restart.");
+    ImGui::TextDisabled("Dirs/probe: c0=16 oct texels, x4 per cascade (paper).");
+    ImGui::TextDisabled("Cascade/base-size changes apply on algo restart.");
 
     ImGui::Separator();
     static const char* kViewLabels[] = {
@@ -213,8 +217,8 @@ void RadianceCascadeGI::DrawImGuiParams() {
         s.DebugView = static_cast<GIDebugView>(viewIdx);
     }
 
-    ImGui::TextDisabled("Hash slots: 2^%u (%u). SDF resident: %s.",
-                        m_Hash.HashLog2, m_Hash.SlotCount, m_HasSDF ? "yes" : "no");
+    ImGui::TextDisabled("Base slots: 2^%u, %u cascades. SDF resident: %s.",
+                        m_Hash.BaseLog2, m_Hash.Cascades, m_HasSDF ? "yes" : "no");
 
     // Phase 14c: probe-count line. Read the most recently staged slot. The host
     // pointer is updated by GPU memcpy-on-coherent-memory; after BeginFrame's
@@ -226,13 +230,13 @@ void RadianceCascadeGI::DrawImGuiParams() {
         const uint32_t v = RadianceCascadeHashReadProbeCount(m_Hash, i);
         if (v > probeCount) probeCount = v;
     }
-    const uint32_t cap     = m_Hash.SlotCount;
+    const uint32_t cap     = m_Hash.BaseSlots;
     const float    loadPct = cap ? (100.0f * static_cast<float>(probeCount) /
                                             static_cast<float>(cap))
                                  : 0.0f;
     if (m_HasReadback) {
-        ImGui::Text("Probes: %u / 2^%u (load %.2f%%)",
-                    probeCount, m_Hash.HashLog2, loadPct);
+        ImGui::Text("c0 probes: %u / 2^%u (load %.2f%%)",
+                    probeCount, m_Hash.BaseLog2, loadPct);
     } else {
         ImGui::TextDisabled("Probes: (no readback yet — enable GI + run a frame)");
     }
@@ -584,6 +588,22 @@ bool RadianceCascadeGI::CreateRelightPipeline() {
     return true;
 }
 
+bool RadianceCascadeGI::CreateResolvePipeline() {
+    VkDescriptorSetLayout sets[1] = { m_Hash.SetLayout };
+    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount = 1; plci.pSetLayouts = sets;
+    if (vkCreatePipelineLayout(m_Ctx->Device, &plci, nullptr,
+                               &m_ResolveLayout) != VK_SUCCESS) {
+        RS_LOG_ERROR("RC GI: resolve pipeline layout failed"); return false;
+    }
+    if (!BuildComputePipeline(m_Ctx->Device, m_ResolveLayout,
+                              m_ShaderDir + "/rc_resolve.spv",
+                              m_ResolvePipeline)) {
+        RS_LOG_ERROR("RC GI: resolve pipeline build failed"); return false;
+    }
+    return true;
+}
+
 bool RadianceCascadeGI::CreateComposePipeline() {
     VkDescriptorSetLayout sets[3] = {
         m_ComposeGBufferSetLayout, m_ComposeLightHdrSetLayout, m_Hash.SetLayout
@@ -615,14 +635,14 @@ namespace {
 
 void FillParams(RcHashParams& p, const RadianceCascadeHash& h,
                 const FrameContext& frame, const GISettings& gi,
-                const glm::vec3& aabbMin, const glm::vec3& aabbMax,
-                float decodeScale, const glm::mat4& worldToLocal) {
-    p.EyePosAndHashLog2 = glm::vec4(frame.Cam.EyePositionWorld, float(h.HashLog2));
+                const glm::mat4& worldToLocal,
+                const glm::vec3& sdfAlbedo) {
+    p.EyePosAndBaseLog2 = glm::vec4(frame.Cam.EyePositionWorld, float(h.BaseLog2));
     p.SunDirAndIntensity = glm::vec4(glm::normalize(frame.SunDirection), frame.SunIntensity);
     p.SunColor          = glm::vec4(frame.SunColor, 0.20f);     // .w = ambient luma
     p.CascadeParams     = glm::vec4(gi.S0Meters,
-                                    float(std::max(1, gi.CascadeCount)),
-                                    float(std::max(4, gi.R0Rays)),
+                                    float(h.Cascades),
+                                    float(RadianceCascadeHash::kD0),
                                     gi.IndirectBoost);
     glm::mat4 ivp = glm::inverse(frame.Cam.Projection * frame.Cam.View);
     // glm matrices are column-major; the shader reconstructs as mat4(c0, c1, c2, c3).
@@ -636,22 +656,23 @@ void FillParams(RcHashParams& p, const RadianceCascadeHash& h,
         gi.BilinearFix ? 1.0f : 0.0f,
         float(static_cast<uint32_t>(gi.DebugView))
     );
-    p.SdfAabbMin = glm::vec4(aabbMin, 0.0f);
-    p.SdfAabbMax = glm::vec4(aabbMax, decodeScale);
 
     // scaleLocalPerWorld = local units per world metre = length of a world-unit
     // basis vector after the world→local rotation+scale. Matches the cone
     // shadow's length(mat3(invModel) * L). Cm-local ShaderBall → ~100.
     const float scaleLocalPerWorld =
         glm::length(glm::vec3(worldToLocal[0]));   // column 0 length
-    p.SecondaryParams = glm::vec4(3.0f, 1.0f, float(frame.FrameIndex),
-                                  scaleLocalPerWorld > 1e-6f ? scaleLocalPerWorld : 1.0f);
+    p.MiscParams = glm::vec4(float(frame.FrameIndex),
+                             scaleLocalPerWorld > 1e-6f ? scaleLocalPerWorld : 1.0f,
+                             0.0f, 0.0f);
 
     // Column-major packing — shader rebuilds mat4(c0,c1,c2,c3).
     p.WorldToLocal0 = worldToLocal[0];
     p.WorldToLocal1 = worldToLocal[1];
     p.WorldToLocal2 = worldToLocal[2];
     p.WorldToLocal3 = worldToLocal[3];
+
+    p.SdfAlbedo = glm::vec4(sdfAlbedo, 0.0f);
 }
 
 void BufferBarrier(VkCommandBuffer cmd, VkBuffer buf,
@@ -671,110 +692,106 @@ void RadianceCascadeGI::RecordPreFrame(VkCommandBuffer cmd, const FrameContext& 
     if (!m_Hash.Initialized || !m_InsertPipeline || !m_Settings) return;
     if (!m_Settings->Enabled) return;
 
-    // 0) One-shot payload zero. Device-local SSBO contents are undefined at
-    //    init, and rc_insert no longer zeroes per-claim (that wiped relight's
-    //    radiance every frame). Clear exactly once, before the first relight.
-    if (!m_PayloadCleared) {
-        RadianceCascadeHashClearPayload(m_Hash, cmd);
-        m_PayloadCleared = true;
-    }
-
-    // 1) Refresh params UBO for this slot.
     RcHashParams params{};
-    FillParams(params, m_Hash, frame, *m_Settings, m_AabbMin, m_AabbMax, m_MaxDist,
-               m_WorldToLocal);
+    FillParams(params, m_Hash, frame, *m_Settings, m_WorldToLocal, m_SdfAlbedo);
     RadianceCascadeHashWriteParams(m_Hash, frame.FrameSlot, params);
 
-    // 2) Relight first (consume LAST frame's hash + payload). On frame 0 the
-    //    hash is empty; the dispatch is cheap (the cell-list count is 0).
-    if (m_HasSDF) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_RelightPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                m_RelightLayout, 0, 1,
-                                &m_RelightSdfSets[frame.FrameSlot], 0, nullptr);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                m_RelightLayout, 1, 1,
-                                &m_Hash.Sets[frame.FrameSlot], 0, nullptr);
-        struct Push { uint32_t maxSteps; float minStep; float maxDistance; uint32_t pad; } pc{};
-        pc.maxSteps    = 32;
-        pc.minStep     = 0.005f;
-        pc.maxDistance = 16.0f;
-        vkCmdPushConstants(cmd, m_RelightLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(pc), &pc);
-
-        // CellList[0] holds the previous-frame count. Worst case = SlotCount.
-        const uint32_t maxCells = m_Hash.SlotCount;
-        const uint32_t groups   = (maxCells + 63u) / 64u;
-        vkCmdDispatch(cmd, groups, 1, 1);
-
-        BufferBarrier(cmd, m_Hash.PayloadBuffer,
-                      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    }
-
-    // 3) Clear hash keys + cell-list counter so this frame's inserts start
-    //    from a clean table.
-    RadianceCascadeHashClearForFrame(m_Hash, cmd);
+    // Fresh table every frame: keys + per-cascade cell counters. (Payload and
+    // resolve need no clear — any texel reachable through a found key is
+    // written by relight/resolve earlier in the same frame.)
+    RadianceCascadeHashClearForFrame(m_Hash, cmd, frame.FrameSlot);
 }
 
 void RadianceCascadeGI::RecordGather(VkCommandBuffer cmd, const FrameContext& frame) {
     if (!m_Hash.Initialized || !m_InsertPipeline || !m_Settings) return;
     if (!m_Settings->Enabled) return;
+    const uint32_t slot = frame.FrameSlot;
 
+    // ---- 1) Insert: screen-driven probes + eye volume, with parent chains ---
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_InsertPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             m_InsertLayout, 0, 1,
-                            &m_InsertGBufferSets[frame.FrameSlot], 0, nullptr);
+                            &m_InsertGBufferSets[slot], 0, nullptr);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             m_InsertLayout, 1, 1,
-                            &m_Hash.Sets[frame.FrameSlot], 0, nullptr);
-
-    // ---- Primary: 4× downsampled visible-pixel insertion --------------------
+                            &m_Hash.Sets[slot], 0, nullptr);
     {
-        struct Push { uint32_t mode; uint32_t downSh; uint32_t secR; uint32_t pad; } pc{};
+        struct Push { uint32_t mode; uint32_t downSh; uint32_t eyeR; uint32_t pad; } pc{};
         pc.mode   = 0;
-        pc.downSh = 2;        // >>2 = 4× downsample
-        pc.secR   = 0;
+        pc.downSh = 2;        // 4× downsampled depth drives insertion
         vkCmdPushConstants(cmd, m_InsertLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         const uint32_t loW = (frame.RenderExtent.width  >> 2);
         const uint32_t loH = (frame.RenderExtent.height >> 2);
-        const uint32_t gx = (loW + 7u) / 8u;
-        const uint32_t gy = (loH + 7u) / 8u;
-        vkCmdDispatch(cmd, gx, gy, 1);
+        vkCmdDispatch(cmd, (loW + 7u) / 8u, (loH + 7u) / 8u, 1);
     }
-
-    BufferBarrier(cmd, m_Hash.KeyBuffer,
-                  VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-    // ---- Secondary: frustum-extended insertion ------------------------------
     {
         const uint32_t R = 2;
-        struct Push { uint32_t mode; uint32_t downSh; uint32_t secR; uint32_t pad; } pc{};
-        pc.mode = 1; pc.downSh = 0; pc.secR = R; pc.pad = 0;
+        struct Push { uint32_t mode; uint32_t downSh; uint32_t eyeR; uint32_t pad; } pc{};
+        pc.mode = 1; pc.eyeR = R;
         vkCmdPushConstants(cmd, m_InsertLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         const uint32_t side = 2u * R + 1u;
-        vkCmdDispatch(cmd, side, side, side);
+        // Insert shader is 8×8×1 threads/group; cover (2R+1)^3 cells.
+        vkCmdDispatch(cmd, (side + 7u) / 8u, (side + 7u) / 8u, side);
     }
 
-    // Make inserts visible to the post-lighting compose pass.
-    BufferBarrier(cmd, m_Hash.KeyBuffer,
+    BufferBarrier(cmd, m_Hash.KeyBuffers[slot],
                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    BufferBarrier(cmd, m_Hash.PayloadBuffer,
+    BufferBarrier(cmd, m_Hash.CellListBuffers[slot],
                   VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-    // Phase 14c: stage CellList[0] for host-side probe-count readout. Records
-    // its own compute->transfer barrier on CellListBuffer internally.
-    RadianceCascadeHashRecordReadback(m_Hash, cmd, frame.FrameSlot);
-    m_LastReadbackSlot = frame.FrameSlot;
+    // ---- 2) Relight top-down: c = N−1 … 0, barrier between levels so each
+    //         child merge reads the parent's FINAL radiance ------------------
+    if (m_HasSDF && m_RelightPipeline) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_RelightPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                m_RelightLayout, 0, 1,
+                                &m_RelightSdfSets[slot], 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                m_RelightLayout, 1, 1,
+                                &m_Hash.Sets[slot], 0, nullptr);
+
+        for (int c = int(m_Hash.Cascades) - 1; c >= 0; --c) {
+            struct Push { uint32_t cascade; uint32_t maxSteps; float minStep; uint32_t pad; } pc{};
+            pc.cascade  = uint32_t(c);
+            pc.maxSteps = 48;
+            pc.minStep  = 0.004f;
+            vkCmdPushConstants(cmd, m_RelightLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(pc), &pc);
+
+            // Threads = slots(c) · dirs(c) = BaseSlots · D0, constant per level.
+            const uint32_t threads = m_Hash.BaseSlots * RadianceCascadeHash::kD0;
+            vkCmdDispatch(cmd, (threads + 63u) / 64u, 1, 1);
+
+            BufferBarrier(cmd, m_Hash.PayloadBuffers[slot],
+                          VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
+    }
+
+    // ---- 3) Resolve cascade 0 → SH-L1 ---------------------------------------
+    if (m_ResolvePipeline) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_ResolvePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                m_ResolveLayout, 0, 1,
+                                &m_Hash.Sets[slot], 0, nullptr);
+        const uint32_t groups = (m_Hash.BaseSlots + 63u) / 64u;
+        vkCmdDispatch(cmd, groups, 1, 1);
+
+        BufferBarrier(cmd, m_Hash.ResolveBuffers[slot],
+                      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    RadianceCascadeHashRecordReadback(m_Hash, cmd, slot);
+    m_LastReadbackSlot = slot;
     m_HasReadback      = true;
 }
 

@@ -831,11 +831,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // misses, and the SH payload stays zero (black irradiance, no GI).
         if (auto* rcgi = dynamic_cast<RS::RadianceCascadeGI*>(gi.get())) {
             glm::mat4 sdfMeshToWorld(1.0f);
+            glm::vec3 sdfAlbedo(0.8f);
             const RS::InstanceRegistry& reg = RS::SceneInstances(scene);
             reg.ForEach([&](RS::InstanceHandle, const RS::GpuInstance& inst) {
-                if (inst.Mesh == activeSdfMesh) sdfMeshToWorld = inst.Transform;
+                if (inst.Mesh == activeSdfMesh) {
+                    sdfMeshToWorld = inst.Transform;
+                    // First-submesh material albedo tints the GI bounce so the
+                    // SDF mesh's colour bleeds onto neighbours (Phase 14c RGB SH).
+                    if (!inst.MaterialBindings.empty() && inst.MaterialBindings[0] != 0) {
+                        sdfAlbedo = materials.Get(inst.MaterialBindings[0]).AlbedoFlat;
+                    }
+                }
             });
             rcgi->SetSDFWorldTransform(sdfMeshToWorld);
+            rcgi->SetSDFAlbedo(sdfAlbedo);
         }
 
         RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
