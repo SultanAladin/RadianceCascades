@@ -28,6 +28,7 @@
 #include "Renderer/FrameContext.h"
 #include "Shadow/IShadowAlgorithm.h"
 #include "Shadow/SDFConeShadow.h"
+#include "GI/RadianceCascades.h"
 #include "RS/RenderSettings.h"
 #include "SDF/GlobalSDF.h"
 #include "Material/MaterialSeed.h"
@@ -46,6 +47,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <memory>
 #include <vector>
 
@@ -355,6 +357,28 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     };
     pushInstanceXformsIfSDFCone();
 
+    // ---- Radiance Cascades GI (rewrite #2), pass 1 — gated on -rcgi --------
+    // When enabled, the debug blit overwrites the swapchain with c0's atlas
+    // slice so we can SEE whether the relight march produced radiance before
+    // any merge pass exists. The normal render path is untouched when off.
+    const bool rcGiEnabled = (std::wcsstr(GetCommandLineW(), L"-rcgi") != nullptr);
+    RS::RadianceCascades rcGi{};
+    if (rcGiEnabled) {
+        if (!RS::RadianceCascadesInitialize(rcGi, vk)) {
+            RS_LOG_ERROR("RadianceCascadesInitialize failed");
+            return 14;
+        }
+        if (!RS::RadianceCascadesConstructAtlases(rcGi, vk)) {
+            RS_LOG_ERROR("RadianceCascadesConstructAtlases failed");
+            return 15;
+        }
+        // Same per-instance inverse-model ring the cone shadow uses; RC reads
+        // InvModel[InstanceIndex] to map each probe ray world -> mesh-local.
+        RS::RadianceCascadesSetInstanceXformBuffer(
+            rcGi, instanceXforms.Buffers.data(), RS::InstanceXformBuffer::kBytes);
+        RS_LOG_INFO("RCGI enabled: %u cascades constructed", rcGi.CascadeCount);
+    }
+
     RS::LightingPass lighting;
     if (!RS::LightingPassInitialize(lighting, vk, targets, sky, *shadow,
                                     "Artifacts/Shaders")) {
@@ -517,6 +541,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                 RS::GBufferPreviewSetSparseSDF(preview, vk,
                                                rs->IndexBuffer, rs->IndexBytes,
                                                rs->PoolBuffer,  rs->PoolBytes);
+                // RCGI: same residency, pushed the SDFConeShadow way. instanceIndex 0
+                // because InstanceXformBufferRefresh packs the single SDF-mesh anchor
+                // contiguously from slot 0 (it is the only resident sparse mesh).
+                if (rcGiEnabled) {
+                    RS::RadianceCascadesSetSDF(rcGi, rs, true, /*instanceIndex*/ 0u);
+                }
             }
         }
 
@@ -606,6 +636,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             const bool hasSparse = (rs != nullptr);
             if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
                 cone->SetSDF(rs, hasSparse);
+            }
+            if (rcGiEnabled) {
+                RS::RadianceCascadesSetSDF(rcGi, rs, hasSparse, /*instanceIndex*/ 0u);
             }
             // Phase 15f — also wire sparse SSBOs into the debug-slice preview.
             // Falls back to the always-bound dummy when no sparse residency exists.
@@ -743,6 +776,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::InstanceXformBufferRefresh(instanceXforms, frame.FrameSlot, scene,
                                        activeSdfMesh, sdfAnchorInstance);
 
+        // RCGI pass 1: dispatch rc_build per cascade now that this slot's xform
+        // ring is current. Leaves all atlases in GENERAL (debug blit reads c0).
+        if (rcGiEnabled) {
+            RS::RadianceCascadesRecordBuild(
+                rcGi, frame.Cmd, frame.FrameSlot,
+                view.EyePositionWorld,
+                previewSettings.SunDirection,
+                glm::vec3(previewSettings.SunIntensity));
+        }
+
         RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
         shadow->RecordShadowPass(frame.Cmd, frameCtx);
         RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
@@ -775,6 +818,43 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::ImGuiContextRSRender (gui,  vk, frame.Cmd, frame.ImageIndex);
         RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
 
+        // RCGI debug: blit c0's Z-slice over the swapchain image. This OVERWRITES
+        // the rendered scene + ImGui on purpose — first-light check that the atlas
+        // holds radiance. The swapchain image is COLOR_ATTACHMENT_OPTIMAL here
+        // (BeginFrame/ImGui); RecordDebugSlice does no destination transitions, so
+        // we bracket it: -> TRANSFER_DST for the blit, then BACK to
+        // COLOR_ATTACHMENT_OPTIMAL because VulkanContextEndFrame's internal barrier
+        // expects that as its oldLayout before transitioning to PRESENT_SRC_KHR.
+        if (rcGiEnabled) {
+            VkImage swap = vk.SwapchainImages[frame.ImageIndex];
+
+            VkImageMemoryBarrier toDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            toDst.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toDst.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toDst.oldLayout           = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            toDst.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toDst.image               = swap;
+            toDst.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCmdPipelineBarrier(frame.Cmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+            RS::RadianceCascadesRecordDebugSlice(
+                rcGi, frame.Cmd, swap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                vk.SwapchainExtent.width, vk.SwapchainExtent.height, /*sliceZ*/ 0u);
+
+            VkImageMemoryBarrier toColor = toDst;
+            toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            toColor.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toColor.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            vkCmdPipelineBarrier(frame.Cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toColor);
+        }
+
         RS::VulkanContextEndFrame(vk,   frame);
     }
 
@@ -785,6 +865,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RS::LightingPassTerminate (lighting, vk);
     shadow->Terminate         (vk);
     shadow.reset();
+    if (rcGiEnabled) RS::RadianceCascadesTerminate(rcGi, vk);
     RS::InstanceXformBufferTerminate(instanceXforms, vk);
     RS::PickingTerminate(picking, vk);
     RS::GBufferPreviewTerminate(preview, vk);

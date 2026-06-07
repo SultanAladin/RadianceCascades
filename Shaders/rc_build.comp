@@ -35,8 +35,14 @@ layout(std430, set = 0, binding = 1) readonly buffer SparsePool { uint Data[]; }
 layout(std140, set = 0, binding = 2) uniform  SparseParamsBuf   { SparseSDFParams P; } uSparseP;
 
 // --- set 0: per-instance world->mesh-local transforms (same SSBO the cone shader binds; RC binds it to its own set) ---
-// std430 array of mat4. invModel = world -> mesh-local. For now we trace a single instance (GridDims.w).
-layout(std430, set = 0, binding = 3) readonly buffer InstanceXforms { mat4 SdfInvModels[]; } uXforms;
+// invModel = world -> mesh-local. The C++ ring (InstanceXformBufferRefresh) writes a 16-byte header
+// (uint count + 3 pad) BEFORE the matrices, so the layout MUST match lighting_sdfcone.comp exactly —
+// declaring just `mat4 SdfInvModels[]` would read the header as matrix[0] and trace into garbage space.
+layout(std430, set = 0, binding = 3) readonly buffer InstanceXforms {
+    uint SdfInstanceCount;
+    uint Pad0, Pad1, Pad2;
+    mat4 SdfInvModels[256];
+} uXforms;
 
 SDFSPARSE_DEFINE_HELPER    (uSparseIdx, uSparsePool)   // SDFSparseSampleHelper    (point sampler)
 SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)   // SDFSparseRaySampleHelper (brick-skip ray sampler)
