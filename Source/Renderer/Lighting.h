@@ -2,8 +2,7 @@
 // Compute pass that composes the lit image from the GBuffer + the active
 // shadow algorithm's set=2 contract. Writes RGBA16F into OffscreenFrame::LightHDR
 // (storage). Per-frame-in-flight descriptor sets for set=1 (GBuffer + IBL +
-// LightHDR storage); set=2 is owned by the IShadowAlgorithm and bound at record
-// time.
+// LightHDR storage); set=2 is owned by SDFConeShadow and bound at record time.
 //
 // Pipeline rebuild: `LightingPassSetShadowAlgorithm` re-creates the pipeline
 // when the active variant changes (specialisation constant kAlgoVariant). The
@@ -28,13 +27,13 @@ struct IShadowAlgorithm;
 struct LightingPass {
     // Owned descriptor / pipeline objects.
     VkDescriptorSetLayout SetLayoutFrame    = VK_NULL_HANDLE;  // set=1
-    VkDescriptorSetLayout SetLayoutGiStub   = VK_NULL_HANDLE;  // set=3 (empty)
+    VkDescriptorSetLayout SetLayoutEmpty0   = VK_NULL_HANDLE;  // set=0 (unused by shader)
     VkDescriptorPool      DescriptorPool    = VK_NULL_HANDLE;
     VkPipelineLayout      PipelineLayout    = VK_NULL_HANDLE;
     VkPipeline            Pipeline          = VK_NULL_HANDLE;
 
     std::array<VkDescriptorSet, VulkanContext::kFramesInFlight> FrameSets{};
-    VkDescriptorSet       GiStubSet         = VK_NULL_HANDLE;
+    VkDescriptorSet       EmptySet0         = VK_NULL_HANDLE;
 
     // Variant that the current pipeline was built against.
     uint32_t              BuiltVariant      = 0xFFFFFFFFu;

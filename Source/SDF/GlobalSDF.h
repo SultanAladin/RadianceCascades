@@ -1,7 +1,7 @@
 // Source/SDF/GlobalSDF.h — Phase 12
 // Residency table keyed by MeshHandle. Owns one 3D R16_SNORM image per resident
-// SDF + one shared linear/clamp sampler. Phase 13 (SDF cone shadows) and Phase
-// 14 (SDFGI) consume this table.
+// SDF + one shared linear/clamp sampler. SDF cone shadows and the preview
+// consume this table.
 //
 // One mesh = one resident SDF. All instances of the same mesh share it (the
 // world-space query path applies each instance's inverse transform). The Bake

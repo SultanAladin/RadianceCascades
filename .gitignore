@@ -36,3 +36,6 @@ Docs/
 
 # Baked SDF cache (regeneratable; large binary)
 Cache/
+
+# Secrets
+API-key

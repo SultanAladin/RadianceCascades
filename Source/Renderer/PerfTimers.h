@@ -24,10 +24,7 @@ enum class PerfPass : uint32_t {
     GBuffer,
     PickingCopy,
     Shadow,
-    GIPreFrame,
-    GIGather,
     Lighting,
-    GICompose,
     Tonemap,
     Preview,
     ImGuiDraw,
@@ -48,7 +45,7 @@ struct PerfTimers {
     std::array<std::array<float, kPerfPassCount>, VulkanContext::kFramesInFlight> LastMs{};
 
     // Per-slot, per-pass "was bracketed this cycle" flag. Used at readback to
-    // skip passes that were gated off (e.g. GI when GI is disabled).
+    // skip passes that were not recorded.
     std::array<std::array<uint8_t, kPerfPassCount>, VulkanContext::kFramesInFlight> WasRecorded{};
 
     // The pass set the host marks via BeginPass during recording. Cleared at

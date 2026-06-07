@@ -10,7 +10,6 @@
 #include <glm/glm.hpp>
 
 #include "RS/Shadow.h"
-#include "RS/GI.h"
 
 namespace RS {
 
@@ -39,8 +38,6 @@ struct CameraView {
 struct FrameTimings {
     float GBufferMs    = 0.0f;
     float ShadowMs     = 0.0f;
-    float GIGatherMs   = 0.0f;
-    float GIRelightMs  = 0.0f;
     float LightingMs   = 0.0f;
     float TonemapMs    = 0.0f;
     float TotalGpuMs   = 0.0f;
@@ -63,7 +60,6 @@ public:
                      FrameTimings*     outTimings);
 
     void SetShadowAlgorithm(ShadowAlgorithmKind kind);
-    void SetGIAlgorithm    (GIAlgorithmKind     kind);
 
     VkImageView OffscreenColorImage   () const;   // RGBA16F, post-tonemap
     VkImageView OffscreenIdentityImage() const;   // RG32UI, instance/submesh ID

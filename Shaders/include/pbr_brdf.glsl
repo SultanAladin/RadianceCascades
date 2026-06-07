@@ -1,6 +1,6 @@
 // Shaders/include/pbr_brdf.glsl
-// Shared PBR BRDF library for lighting.comp, lighting_pcss.comp,
-// lighting_vsm.comp, gbuffer_preview.frag, and any future variant.
+// Shared PBR BRDF library for lighting_sdfcone.comp, gbuffer_preview.frag, and
+// any future variant.
 //
 // "Cheap" path: classic Karis 2013 Cook-Torrance — Lambert diffuse,
 // uncompensated Smith-GGX specular, scalar Schlick Fresnel.

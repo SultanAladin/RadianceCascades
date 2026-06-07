@@ -92,7 +92,7 @@ bool CreateDescriptorPool(VkDevice device, VkDescriptorPool& outPool) {
     sizes[1].descriptorCount = 1  * VulkanContext::kFramesInFlight;
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets       = VulkanContext::kFramesInFlight + 1;    // +1 for the GI stub set
+    pci.maxSets       = VulkanContext::kFramesInFlight + 1;    // +1 for unused set=0
     pci.poolSizeCount = 2;
     pci.pPoolSizes    = sizes;
     return vkCreateDescriptorPool(device, &pci, nullptr, &outPool) == VK_SUCCESS;
@@ -163,25 +163,23 @@ bool AllocateFrameSets(VkDevice device, LightingPass& lp,
     return true;
 }
 
-bool AllocateGiStubSet(VkDevice device, LightingPass& lp) {
+bool AllocateEmptySet0(VkDevice device, LightingPass& lp) {
     VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     ai.descriptorPool     = lp.DescriptorPool;
     ai.descriptorSetCount = 1;
-    ai.pSetLayouts        = &lp.SetLayoutGiStub;
-    return vkAllocateDescriptorSets(device, &ai, &lp.GiStubSet) == VK_SUCCESS;
+    ai.pSetLayouts        = &lp.SetLayoutEmpty0;
+    return vkAllocateDescriptorSets(device, &ai, &lp.EmptySet0) == VK_SUCCESS;
 }
 
 bool BuildPipelineLayout(LightingPass& lp, VkDevice device,
                          VkDescriptorSetLayout shadowLayout) {
-    // Pipeline layout = [set0=empty (GI placeholder), set1=Frame,
-    //                    set2=shadow algo, set3=GI stub].
-    // The GLSL shader puts its bindings on sets 1/2/3, so set 0 must still be
+    // Pipeline layout = [set0=empty, set1=Frame, set2=shadow algo].
+    // The GLSL shader puts its bindings on sets 1/2, so set 0 must still be
     // declared to keep set indices contiguous.
-    VkDescriptorSetLayout setLayouts[4] = {
-        lp.SetLayoutGiStub,    // set=0 (empty — placeholder)
+    VkDescriptorSetLayout setLayouts[3] = {
+        lp.SetLayoutEmpty0,    // set=0 (unused)
         lp.SetLayoutFrame,     // set=1
         shadowLayout,          // set=2
-        lp.SetLayoutGiStub,    // set=3
     };
 
     VkPushConstantRange pc{};
@@ -190,7 +188,7 @@ bool BuildPipelineLayout(LightingPass& lp, VkDevice device,
     pc.size       = sizeof(LightingPushConstants);
 
     VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    plci.setLayoutCount         = 4;
+    plci.setLayoutCount         = 3;
     plci.pSetLayouts            = setLayouts;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges    = &pc;
@@ -200,18 +198,12 @@ bool BuildPipelineLayout(LightingPass& lp, VkDevice device,
 bool BuildPipeline(LightingPass& lp, VkDevice device, const char* shaderDir,
                    uint32_t variant) {
     // Each shadow variant is its own SPV — the set=2 descriptor layout differs
-    // across variants (PCF: 2 bindings, PCSS: 3, VSM: 2 different types,
+    // across variants (SDFCone uses sparse-SDF buffers and UBOs),
     // SDFCone: sampler3D + UBO), and GLSL can't redeclare a sampler at the
     // same binding with different types, so a single SPV with a spec-constant
     // branch isn't viable.
-    const char* shaderName = "lighting.spv";
-    switch (variant) {
-        case 0: shaderName = "lighting.spv";          break;   // PCF
-        case 1: shaderName = "lighting_pcss.spv";     break;   // PCSS
-        case 2: shaderName = "lighting_vsm.spv";      break;   // VSM
-        case 3: shaderName = "lighting_sdfcone.spv";  break;   // SDFCone (Phase 13)
-        default: shaderName = "lighting.spv";         break;
-    }
+    (void)variant;
+    const char* shaderName = "lighting_sdfcone.spv";
     const std::string sp = std::string(shaderDir) + "/" + shaderName;
     VkShaderModule cs = LoadModule(device, sp.c_str());
     if (!cs) return false;
@@ -244,15 +236,15 @@ bool LightingPassInitialize(LightingPass& lp, const VulkanContext& ctx,
     if (!CreateFrameSetLayout(ctx.Device, lp.SetLayoutFrame)) {
         RS_LOG_ERROR("Lighting: frame set layout failed"); return false;
     }
-    if (!CreateEmptySetLayout(ctx.Device, lp.SetLayoutGiStub)) {
-        RS_LOG_ERROR("Lighting: GI stub layout failed"); return false;
+    if (!CreateEmptySetLayout(ctx.Device, lp.SetLayoutEmpty0)) {
+        RS_LOG_ERROR("Lighting: empty set=0 layout failed"); return false;
     }
     if (!CreateDescriptorPool(ctx.Device, lp.DescriptorPool)) {
         RS_LOG_ERROR("Lighting: descriptor pool failed"); return false;
     }
     if (!AllocateFrameSets(ctx.Device, lp, targets, sky)) return false;
-    if (!AllocateGiStubSet(ctx.Device, lp)) {
-        RS_LOG_ERROR("Lighting: GI stub set alloc failed"); return false;
+    if (!AllocateEmptySet0(ctx.Device, lp)) {
+        RS_LOG_ERROR("Lighting: empty set=0 alloc failed"); return false;
     }
     if (!BuildPipelineLayout(lp, ctx.Device, shadowAlgo.LightingSetLayout())) {
         RS_LOG_ERROR("Lighting: pipeline layout failed"); return false;
@@ -275,14 +267,14 @@ void LightingPassTerminate(LightingPass& lp, const VulkanContext& ctx) {
     if (lp.PipelineLayout)   vkDestroyPipelineLayout     (ctx.Device, lp.PipelineLayout,   nullptr);
     if (lp.DescriptorPool)   vkDestroyDescriptorPool     (ctx.Device, lp.DescriptorPool,   nullptr);
     if (lp.SetLayoutFrame)   vkDestroyDescriptorSetLayout(ctx.Device, lp.SetLayoutFrame,   nullptr);
-    if (lp.SetLayoutGiStub)  vkDestroyDescriptorSetLayout(ctx.Device, lp.SetLayoutGiStub,  nullptr);
+    if (lp.SetLayoutEmpty0)  vkDestroyDescriptorSetLayout(ctx.Device, lp.SetLayoutEmpty0,  nullptr);
     lp.Pipeline         = VK_NULL_HANDLE;
     lp.PipelineLayout   = VK_NULL_HANDLE;
     lp.DescriptorPool   = VK_NULL_HANDLE;
     lp.SetLayoutFrame   = VK_NULL_HANDLE;
-    lp.SetLayoutGiStub  = VK_NULL_HANDLE;
+    lp.SetLayoutEmpty0  = VK_NULL_HANDLE;
     lp.FrameSets        = {};
-    lp.GiStubSet        = VK_NULL_HANDLE;
+    lp.EmptySet0        = VK_NULL_HANDLE;
     lp.BuiltVariant     = 0xFFFFFFFFu;
     lp.BuiltShadowLayout= VK_NULL_HANDLE;
     lp.Initialized      = false;
@@ -348,14 +340,13 @@ void LightingPassRecord(LightingPass& lp, const VulkanContext& /*ctx*/,
     // 2) Bind pipeline + sets.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lp.Pipeline);
 
-    // set=0 = GI stub (empty), set=1 = frame, set=3 = GI stub.
+    // set=0 is unused by the shader, but must be bound so set=1 and set=2 stay
+    // at their declared indices.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lp.PipelineLayout,
-                            0, 1, &lp.GiStubSet, 0, nullptr);
+                            0, 1, &lp.EmptySet0, 0, nullptr);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lp.PipelineLayout,
                             1, 1, &lp.FrameSets[frameSlot], 0, nullptr);
     shadowAlgo.BindLightingDescriptorSet(cmd, lp.PipelineLayout, frameSlot, 2);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lp.PipelineLayout,
-                            3, 1, &lp.GiStubSet, 0, nullptr);
 
     // 3) Push constants.
     LightingPushConstants pc{};

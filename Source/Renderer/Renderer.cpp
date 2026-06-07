@@ -16,8 +16,7 @@ struct Renderer::Impl {
     InitDesc Init{};
     bool     Initialised = false;
 
-    ShadowAlgorithmKind ShadowKind = ShadowAlgorithmKind::PCF;
-    GIAlgorithmKind     GIKind     = GIAlgorithmKind::SDFGI;
+    ShadowAlgorithmKind ShadowKind = ShadowAlgorithmKind::SDFCone;
 
     // Phase 1 stubs — Phase 5 replaces these with the real registries.
     Scene            Scene_;
@@ -62,10 +61,6 @@ void Renderer::RenderFrame(VkCommandBuffer /*cmd*/,
 
 void Renderer::SetShadowAlgorithm(ShadowAlgorithmKind kind) {
     if (m_Impl) m_Impl->ShadowKind = kind;
-}
-
-void Renderer::SetGIAlgorithm(GIAlgorithmKind kind) {
-    if (m_Impl) m_Impl->GIKind = kind;
 }
 
 VkImageView Renderer::OffscreenColorImage   () const { return VK_NULL_HANDLE; }

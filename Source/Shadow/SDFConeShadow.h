@@ -50,7 +50,7 @@ public:
     ~SDFConeShadow() = default;
 
     const char* Name() const override { return "SDF Cone"; }
-    uint32_t    AlgoVariant() const override { return 3; }
+    uint32_t    AlgoVariant() const override { return 0; }
 
     void Initialize(const VulkanContext& ctx,
                     VkFormat depthFormat,
@@ -115,7 +115,7 @@ private:
     VkBuffer        m_DummyBuffer = VK_NULL_HANDLE;
     VkDeviceMemory  m_DummyMemory = VK_NULL_HANDLE;
 
-    // Per-frame AlgoUbo (host-visible coherent — matches PCFShadow's pattern).
+    // Per-frame AlgoUbo (host-visible coherent).
     struct AlgoUbo {
         glm::vec4 SunDirAndHalfAngle;     // xyz = direction TOWARD sun, w = half-angle (rad)
         glm::vec4 TraceParamsAndSurfOff;  // x = maxSteps, y = maxDistance, z = minStep, w = surfaceOffset

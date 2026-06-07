@@ -1,7 +1,7 @@
 // Source/Renderer/InstanceXformBuffer.h — Phase 13.5
-// Per-instance inverse-model SSBO. Bound by SDFCone shadows (and Phase 14b
-// rc_relight) so the trace can map world-space pixels into mesh-local space
-// of whichever instance the pixel belongs to. The instance handle comes from
+// Per-instance inverse-model SSBO. Bound by SDFCone shadows so the trace can
+// map world-space pixels into mesh-local space of whichever instance the pixel
+// belongs to. The instance handle comes from
 // the GBuffer identity attachment's R channel.
 //
 // Layout (matches sdf_trace consumers):
@@ -45,8 +45,8 @@ void InstanceXformBufferTerminate (InstanceXformBuffer& xb, const VulkanContext&
 // if 1 m == 1 cm — so the resident ball's shadow appears 100× larger on the
 // floor. We patch around it here by routing every non-SDF-mesh instance to
 // the SDF anchor's invModel. That gives the floor a single correctly-scaled
-// shadow under the anchor ball; multi-ball shadows on the floor land with
-// the multi-mesh SDF in Phase 14b/16.
+// shadow under the anchor ball; multi-ball shadows on the floor need a
+// multi-mesh SDF.
 //
 // Pass `sdfMesh = 0` to disable the fallback (every non-SDF instance gets
 // identity, restoring pre-fix behavior).

@@ -119,10 +119,7 @@ const char* PerfPassName(PerfPass pass) {
         case PerfPass::GBuffer:     return "GBuffer";
         case PerfPass::PickingCopy: return "PickingCopy";
         case PerfPass::Shadow:      return "Shadow";
-        case PerfPass::GIPreFrame:  return "GI PreFrame";
-        case PerfPass::GIGather:    return "GI Gather";
         case PerfPass::Lighting:    return "Lighting";
-        case PerfPass::GICompose:   return "GI Compose";
         case PerfPass::Tonemap:     return "Tonemap";
         case PerfPass::Preview:     return "Preview";
         case PerfPass::ImGuiDraw:   return "ImGui";

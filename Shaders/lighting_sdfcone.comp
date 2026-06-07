@@ -1,9 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // Phase 13 lighting compose — SDFCone variant. Same Karis/Schlick/Smith path as
-// lighting.comp, but the shadow factor comes from a sphere-traced soft shadow
+// The shadow factor comes from a sphere-traced soft shadow
 // against the resident mesh SDF. The trace primitive lives in
-// `include/sdf_trace.glsl` so rc_relight.comp shares it.
+// `include/sdf_trace.glsl`.
 //
 // Phase 15d: sparse SDF — the sampler3D bind point is replaced by a sparse-VDB
 // pair (BrickIndex SSBO + BrickPool SSBO) plus a SparseParams UBO. The sphere
