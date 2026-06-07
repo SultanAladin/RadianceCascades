@@ -11,6 +11,11 @@
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
+// Suppress the windows.h min/max macros — they mangle std::min / std::max in any
+// TU that combines this header with the STL (e.g. GI/CascadeSpecification.hpp).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 // vkCreateWin32SurfaceKHR + VK_KHR_WIN32_SURFACE_EXTENSION_NAME live behind

@@ -50,8 +50,12 @@ SDFTRACE_DEFINE_SPARSE_HELPERS()                       // SDF_TraceHitSparse + S
 //                                                       CONSTANTS
 //------------------------------------------------------------------------------------------------------------------------
 
-// One workgroup thread per (direction-texel-x, direction-texel-y) within ONE probe; Z dispatch walks probes. Local
-// size 8x8 covers up to OctSide=8 in one group; for larger OctSide the dispatch tiles in X/Y (see dispatch note below).
+// FLATTENED-ATLAS DISPATCH (fixes the c0 Z-overflow: probe^3 = 64^3 = 262144 > the 65535 groupCountZ limit). The
+// dispatch is sized as the atlas itself, so the global invocation IS the destination atlas texel directly:
+//     AtlasWidth  = ProbeAxisCount * OctSide   (probeX folded with directionX in X)
+//     AtlasHeight = ProbeAxisCount * OctSide   (probeY folded with directionY in Y)
+//     AtlasDepth  = ProbeAxisCount             (bare probe-Z; octahedral is 2D, there is no directionZ) -- A5 invariant.
+// C++ dispatches groupCount = (ceil(W/8), ceil(H/8), AtlasDepth); AtlasDepth <= 64 stays well under 65535.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 const float HitEpsilonLocal = 0.001;   // [-] - local-units surface threshold (matches SDF_TraceHitSparse)
@@ -95,21 +99,25 @@ void main()
     const uint ProbeAxis = uCascade.C.GridDims.x;
     const uint OctSide   = uCascade.C.GridDims.y;
 
-    // Decode which probe and which octahedral direction-texel this invocation owns.
-    // gl_GlobalInvocationID.z walks the flattened probe grid (px + py*ProbeAxis + pz*ProbeAxis*ProbeAxis).
-    // gl_GlobalInvocationID.xy walks the OctSide x OctSide direction tile of THAT probe.
-    const uint DirectionX = gl_GlobalInvocationID.x;
-    const uint DirectionY = gl_GlobalInvocationID.y;
-    const uint ProbeFlat  = gl_GlobalInvocationID.z;
+    // Flattened-atlas decode (A5). The global invocation IS the destination atlas texel:
+    //   X folds (probeX, directionX): X = probeX*OctSide + directionX
+    //   Y folds (probeY, directionY): Y = probeY*OctSide + directionY
+    //   Z is the bare probe-Z (no direction tiling in Z; octahedral is a 2D map).
+    const uint FlatX  = gl_GlobalInvocationID.x;   // 0 .. ProbeAxis*OctSide - 1
+    const uint FlatY  = gl_GlobalInvocationID.y;   // 0 .. ProbeAxis*OctSide - 1
+    const uint ProbeZ = gl_GlobalInvocationID.z;   // 0 .. ProbeAxis - 1
 
-    if (DirectionX >= OctSide || DirectionY >= OctSide) return;
+    const uint AtlasWidth  = ProbeAxis * OctSide;
+    const uint AtlasHeight = ProbeAxis * OctSide;
 
-    const uint ProbeTotal = ProbeAxis * ProbeAxis * ProbeAxis;
-    if (ProbeFlat >= ProbeTotal) return;
+    // Over-dispatch guard: ceil(W/8)*8 may exceed AtlasWidth when OctSide does not divide 8.
+    if (FlatX >= AtlasWidth || FlatY >= AtlasHeight) return;
+    if (ProbeZ >= ProbeAxis)                         return;
 
-    const uint ProbeX = ProbeFlat % ProbeAxis;
-    const uint ProbeY = (ProbeFlat / ProbeAxis) % ProbeAxis;
-    const uint ProbeZ = ProbeFlat / (ProbeAxis * ProbeAxis);
+    const uint ProbeX     = FlatX / OctSide;
+    const uint DirectionX = FlatX % OctSide;
+    const uint ProbeY     = FlatY / OctSide;
+    const uint DirectionY = FlatY % OctSide;
 
     // Probe world position: region origin + (probeIndex + 0.5) * pitch  (probe sits at cell centre).
     const float ProbePitch = uCascade.C.RegionOriginWorld.w;
@@ -173,10 +181,9 @@ void main()
         Transmittance = 1.0;
     }
 
-    // Write to this cascade's atlas at the probe's owned direction-texel (A5 layout).
-    const ivec3 AtlasTexel = ivec3(int(ProbeX) * int(OctSide) + int(DirectionX),
-                                   int(ProbeY) * int(OctSide) + int(DirectionY),
-                                   int(ProbeZ));
+    // Write to this cascade's atlas. Under the flattened decode the invocation already IS the
+    // owned texel: (FlatX, FlatY, ProbeZ) == (probeX*OctSide+dirX, probeY*OctSide+dirY, probeZ) (A5 layout).
+    const ivec3 AtlasTexel = ivec3(int(FlatX), int(FlatY), int(ProbeZ));
 
     imageStore(uCascadeAtlas, AtlasTexel, vec4(Radiance, Transmittance));
 }

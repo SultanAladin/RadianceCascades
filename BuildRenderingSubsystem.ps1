@@ -314,6 +314,7 @@ try {
         "Source\Renderer\Picking.cpp",
         "Source\Renderer\InstanceXformBuffer.cpp",
         "Source\Shadow\SDFConeShadow.cpp",
+        "Source\GI\RadianceCascades.cpp",
         "Source\SDF\MeshSDFBaker.cpp",
         "Source\SDF\GlobalSDF.cpp",
         "Source\SDF\SDFTrace.cpp",
