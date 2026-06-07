@@ -112,6 +112,17 @@ static bool CreateSetLayouts(RadianceCascades& rc) {
     cci.pBindings    = cascade;
     if (vkCreateDescriptorSetLayout(device, &cci, nullptr, &rc.SetLayoutCascade) != VK_SUCCESS) return false;
 
+    // set 0 (merge): merge-params UBO + two storage images (cascade N + upper N+1).
+    VkDescriptorSetLayoutBinding merge[3]{};
+    merge[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    merge[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    merge[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+    VkDescriptorSetLayoutCreateInfo mergeCI{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    mergeCI.bindingCount = 3;
+    mergeCI.pBindings    = merge;
+    if (vkCreateDescriptorSetLayout(device, &mergeCI, nullptr, &rc.SetLayoutMerge) != VK_SUCCESS) return false;
+
     return true;
 }
 
@@ -139,6 +150,7 @@ static bool CreateUboRings(RadianceCascades& rc) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(rc.Ctx->PhysicalDevice, &props);
     rc.CascadeBuildStride = AlignUp(sizeof(CascadeBuildParams), props.limits.minUniformBufferOffsetAlignment);
+    rc.MergeParamsStride  = AlignUp(sizeof(RcMergeParams),      props.limits.minUniformBufferOffsetAlignment);
 
     for (RcFrameResources& frame : rc.Frames) {
         if (!CreateHostBuffer(*rc.Ctx, rc.CascadeBuildStride * kMaxCascades,
@@ -153,6 +165,10 @@ static bool CreateUboRings(RadianceCascades& rc) {
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                               frame.SparseParamsBuffer, frame.SparseParamsMemory, &frame.SparseParamsMapped))
             return false;
+        if (!CreateHostBuffer(*rc.Ctx, rc.MergeParamsStride * kMaxCascades,
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                              frame.MergeParamsBuffer, frame.MergeParamsMemory, &frame.MergeParamsMapped))
+            return false;
     }
     return true;
 }
@@ -162,13 +178,14 @@ static bool CreateDescriptorPoolAndSets(RadianceCascades& rc) {
     const uint32_t frames = VulkanContext::kFramesInFlight;
 
     // Per frame: set 0 (2 SSBO idx/pool + 1 SSBO xform + 1 UBO params) + set 1 x kMaxCascades (2 UBO + 1 image).
+    // Pool sizes include merge sets: +kMaxCascades UBOs (merge params) and +2*kMaxCascades storage images (N + upper).
     VkDescriptorPoolSize sizes[3]{};
-    sizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, frames * 3 };                         // idx + pool + xform
-    sizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames * (1 + 2 * kMaxCascades) };    // sparse params + build/lighting per cascade
-    sizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  frames * kMaxCascades };              // one atlas image per cascade
+    sizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, frames * 3 };                           // idx + pool + xform
+    sizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames * (1 + 3 * kMaxCascades) };      // sparse params + build/lighting + merge per cascade
+    sizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  frames * 3 * kMaxCascades };            // build atlas + merge (N + upper) per cascade
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    pci.maxSets       = frames * (1 + kMaxCascades);
+    pci.maxSets       = frames * (1 + 2 * kMaxCascades);
     pci.poolSizeCount = 3;
     pci.pPoolSizes    = sizes;
     if (vkCreateDescriptorPool(device, &pci, nullptr, &rc.DescriptorPool) != VK_SUCCESS) return false;
@@ -189,6 +206,16 @@ static bool CreateDescriptorPoolAndSets(RadianceCascades& rc) {
         ca.pSetLayouts        = cascadeLayouts;
         if (vkAllocateDescriptorSets(device, &ca, frame.CascadeSets.data()) != VK_SUCCESS) return false;
 
+        // Merge sets: one per cascade (merge-params UBO + atlas pair for N and N+1).
+        VkDescriptorSetLayout mergeLayouts[kMaxCascades];
+        for (uint32_t c = 0; c < kMaxCascades; ++c) mergeLayouts[c] = rc.SetLayoutMerge;
+
+        VkDescriptorSetAllocateInfo ma{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        ma.descriptorPool     = rc.DescriptorPool;
+        ma.descriptorSetCount = kMaxCascades;
+        ma.pSetLayouts        = mergeLayouts;
+        if (vkAllocateDescriptorSets(device, &ma, frame.MergeSets.data()) != VK_SUCCESS) return false;
+
         // Static set-0 UBO binding (binding 2 = sparse params); SSBOs (0,1,3) written by RewriteSparseSets.
         VkDescriptorBufferInfo paramInfo{ frame.SparseParamsBuffer, 0, sizeof(RcSparseParams) };
         VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
@@ -206,8 +233,8 @@ static bool CreatePipeline(RadianceCascades& rc) {
     VkDevice device = rc.Ctx->Device;
 
     std::vector<char> spirv;
-    if (!LoadSpirv("Artifacts/Shaders/rc_build.comp.spv", spirv)) {
-        RS_LOG_ERROR("RadianceCascades: rc_build.comp.spv not found in Artifacts/Shaders");
+    if (!LoadSpirv("Artifacts/Shaders/rc_build.spv", spirv)) {
+        RS_LOG_ERROR("RadianceCascades: rc_build.spv not found in Artifacts/Shaders");
         return false;
     }
 
@@ -239,6 +266,42 @@ static bool CreatePipeline(RadianceCascades& rc) {
     return r == VK_SUCCESS;
 }
 
+static bool CreateMergePipeline(RadianceCascades& rc) {
+    VkDevice device = rc.Ctx->Device;
+
+    std::vector<char> spirv;
+    if (!LoadSpirv("Artifacts/Shaders/rc_merge.spv", spirv)) {
+        RS_LOG_ERROR("RadianceCascades: rc_merge.spv not found in Artifacts/Shaders");
+        return false;
+    }
+
+    VkShaderModuleCreateInfo mci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    mci.codeSize = spirv.size();
+    mci.pCode    = reinterpret_cast<const uint32_t*>(spirv.data());
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device, &mci, nullptr, &module) != VK_SUCCESS) return false;
+
+    VkPipelineLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    lci.setLayoutCount = 1;
+    lci.pSetLayouts    = &rc.SetLayoutMerge;
+    if (vkCreatePipelineLayout(device, &lci, nullptr, &rc.MergePipelineLayout) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, module, nullptr);
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stage{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+    stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = module;
+    stage.pName  = "main";
+
+    VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    cpci.stage  = stage;
+    cpci.layout = rc.MergePipelineLayout;
+    const VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &rc.MergePipeline);
+    vkDestroyShaderModule(device, module, nullptr);
+    return r == VK_SUCCESS;
+}
+
 bool RadianceCascadesInitialize(RadianceCascades& rc, const VulkanContext& ctx) {
     rc.Ctx = &ctx;
     ResolveLevels(rc);
@@ -253,6 +316,7 @@ bool RadianceCascadesInitialize(RadianceCascades& rc, const VulkanContext& ctx) 
     if (!CreateUboRings(rc))             { RS_LOG_ERROR("RadianceCascades: UBO rings failed");      return false; }
     if (!CreateDescriptorPoolAndSets(rc)){ RS_LOG_ERROR("RadianceCascades: descriptor sets failed");return false; }
     if (!CreatePipeline(rc))             { RS_LOG_ERROR("RadianceCascades: pipeline failed");       return false; }
+    if (!CreateMergePipeline(rc))        { RS_LOG_ERROR("RadianceCascades: merge pipeline failed"); return false; }
 
     RS_LOG_INFO("RadianceCascades initialized (%u cascades, awaiting atlases + SetSDF)", rc.CascadeCount);
     return true;
@@ -321,6 +385,33 @@ static void WriteCascadeDescriptors(RadianceCascades& rc) {
     }
 }
 
+// Write merge descriptor sets: per-cascade MergeParams UBO + atlas pair (N, N+1).
+// Called from ConstructAtlases once atlas views exist.
+static void WriteMergeDescriptors(RadianceCascades& rc) {
+    VkDevice device = rc.Ctx->Device;
+    if (rc.CascadeCount < 2) return;
+
+    for (RcFrameResources& frame : rc.Frames) {
+        for (uint32_t c = 0; c + 1 < rc.CascadeCount; ++c) {
+            VkDescriptorBufferInfo mergeInfo{ frame.MergeParamsBuffer, rc.MergeParamsStride * c, sizeof(RcMergeParams) };
+
+            VkDescriptorImageInfo imageN{};
+            imageN.imageView   = rc.Atlases[c].View;
+            imageN.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo imageUpper{};
+            imageUpper.imageView   = rc.Atlases[c + 1].View;
+            imageUpper.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet w[3]{};
+            w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.MergeSets[c], 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &mergeInfo, nullptr };
+            w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.MergeSets[c], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  &imageN,    nullptr, nullptr };
+            w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.MergeSets[c], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  &imageUpper, nullptr, nullptr };
+            vkUpdateDescriptorSets(device, 3, w, 0, nullptr);
+        }
+    }
+}
+
 bool RadianceCascadesConstructAtlases(RadianceCascades& rc, const VulkanContext& ctx) {
     VkDevice device = ctx.Device;
 
@@ -370,6 +461,7 @@ bool RadianceCascadesConstructAtlases(RadianceCascades& rc, const VulkanContext&
 
     TransitionAtlasesToGeneral(rc);
     WriteCascadeDescriptors(rc);
+    WriteMergeDescriptors(rc);
     RS_LOG_INFO("RadianceCascades atlases constructed (%u cascades, c0 = %ux%ux%u)",
                 rc.CascadeCount, rc.Atlases[0].Extent.x, rc.Atlases[0].Extent.y, rc.Atlases[0].Extent.z);
     return true;
@@ -492,6 +584,7 @@ void RadianceCascadesRecordBuild(RadianceCascades& rc,
         // Clipmap snap: region origin = camera - radius, rounded down to the probe pitch.
         const glm::vec3 rawOrigin     = cameraEyeWorld - glm::vec3(kRcQueryRadiusMetres);
         const glm::vec3 snappedOrigin = glm::floor(rawOrigin / pitch) * pitch;
+        rc.LastSnappedOrigins[c] = snappedOrigin;
 
         CascadeBuildParams build{};
         build.RegionOriginWorld = glm::vec4(snappedOrigin, pitch);
@@ -525,6 +618,66 @@ void RadianceCascadesRecordBuild(RadianceCascades& rc,
 }
 
 //------------------------------------------------------------------------------------------------------------------------
+//                                                    RECORD MERGE
+//------------------------------------------------------------------------------------------------------------------------
+
+void RadianceCascadesRecordMerge(RadianceCascades& rc, VkCommandBuffer cmd, uint32_t frameSlot) {
+    if (rc.CascadeCount < 2) return;   // need at least 2 cascades to merge
+
+    RcFrameResources& frame = rc.Frames[frameSlot];
+
+    // Fill MergeParams UBO for each cascade that will be merged.
+    const float basePitch = Cascades::ResolveBaseProbePitch(rc.Spec);
+    for (uint32_t c = 0; c + 1 < rc.CascadeCount; ++c) {
+        const Cascades::CascadeDescriptor& levelN     = rc.Levels[c];
+        const Cascades::CascadeDescriptor& levelUpper = rc.Levels[c + 1];
+        const float pitchN     = basePitch * std::pow(2.0f, static_cast<float>(c));
+        const float pitchUpper = basePitch * std::pow(2.0f, static_cast<float>(c + 1));
+
+        RcMergeParams merge{};
+        merge.ProbeOriginN     = glm::vec4(rc.LastSnappedOrigins[c],     pitchN);
+        merge.ProbeOriginUpper = glm::vec4(rc.LastSnappedOrigins[c + 1], pitchUpper);
+        merge.IntervalEndN     = glm::vec4(levelN.IntervalEnd, 0.0f, 0.0f, 0.0f);
+        merge.DimsN            = glm::uvec4(levelN.OctSide, levelN.ProbeAxisCount, levelN.AtlasWidth, 0u);
+        merge.DimsUpper        = glm::uvec4(levelUpper.OctSide, levelUpper.ProbeAxisCount, levelUpper.AtlasWidth, 0u);
+
+        std::memcpy(static_cast<char*>(frame.MergeParamsMapped) + rc.MergeParamsStride * c,
+                    &merge, sizeof(RcMergeParams));
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rc.MergePipeline);
+
+    // Merge iteratively from coarsest-1 down to 0.
+    for (int c = static_cast<int>(rc.CascadeCount) - 2; c >= 0; --c) {
+
+        // Barrier: ensure the upper cascade (c+1) is finished building / merging before reading.
+        VkImageMemoryBarrier upperBarrier{};
+        upperBarrier.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        upperBarrier.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+        upperBarrier.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+        upperBarrier.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
+        upperBarrier.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+        upperBarrier.image            = rc.Atlases[c + 1].Image;
+        upperBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &upperBarrier);
+
+        // Bind merge descriptor set for cascade c.
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            rc.MergePipelineLayout, 0, 1, &frame.MergeSets[c], 0, nullptr);
+
+        // Dispatch (matching the flattened 3D grid shape of cascade c).
+        const uint32_t groupX = (rc.Levels[c].AtlasWidth  + 7u) / 8u;
+        const uint32_t groupY = (rc.Levels[c].AtlasHeight + 7u) / 8u;
+        const uint32_t groupZ = rc.Levels[c].AtlasDepth;
+        vkCmdDispatch(cmd, groupX, groupY, groupZ);
+    }
+}
+
+//------------------------------------------------------------------------------------------------------------------------
 //                                                    DEBUG SLICE BLIT
 //------------------------------------------------------------------------------------------------------------------------
 
@@ -534,9 +687,15 @@ void RadianceCascadesRecordDebugSlice(RadianceCascades& rc,
                                       VkImageLayout destinationLayout,
                                       uint32_t destinationWidth,
                                       uint32_t destinationHeight,
+                                      uint32_t cascadeIndex,
                                       uint32_t sliceZ) {
-    CascadeAtlas& source = rc.Atlases[0];
-    if (source.Image == VK_NULL_HANDLE) return;
+    if (rc.CascadeCount == 0) return;
+
+    const uint32_t cascade = (cascadeIndex < rc.CascadeCount)
+        ? cascadeIndex
+        : (rc.CascadeCount - 1);
+    CascadeAtlas& source = rc.Atlases[cascade];
+    if (source.Image == VK_NULL_HANDLE || source.Extent.z == 0) return;
 
     const uint32_t z = (sliceZ < source.Extent.z) ? sliceZ : (source.Extent.z - 1);
 
@@ -579,6 +738,9 @@ void RadianceCascadesTerminate(RadianceCascades& rc, const VulkanContext& ctx) {
         if (frame.LightingMemory)     vkFreeMemory(device, frame.LightingMemory, nullptr);
         if (frame.SparseParamsBuffer) vkDestroyBuffer(device, frame.SparseParamsBuffer, nullptr);
         if (frame.SparseParamsMemory) vkFreeMemory(device, frame.SparseParamsMemory, nullptr);
+        if (frame.MergeParamsMapped)  vkUnmapMemory(device, frame.MergeParamsMemory);
+        if (frame.MergeParamsBuffer)  vkDestroyBuffer(device, frame.MergeParamsBuffer, nullptr);
+        if (frame.MergeParamsMemory)  vkFreeMemory(device, frame.MergeParamsMemory, nullptr);
         frame = RcFrameResources{};
     }
 
@@ -586,13 +748,18 @@ void RadianceCascadesTerminate(RadianceCascades& rc, const VulkanContext& ctx) {
     if (rc.DummyMemory)         vkFreeMemory(device, rc.DummyMemory, nullptr);
     if (rc.BuildPipeline)       vkDestroyPipeline(device, rc.BuildPipeline, nullptr);
     if (rc.BuildPipelineLayout) vkDestroyPipelineLayout(device, rc.BuildPipelineLayout, nullptr);
+    if (rc.MergePipeline)       vkDestroyPipeline(device, rc.MergePipeline, nullptr);
+    if (rc.MergePipelineLayout) vkDestroyPipelineLayout(device, rc.MergePipelineLayout, nullptr);
     if (rc.DescriptorPool)      vkDestroyDescriptorPool(device, rc.DescriptorPool, nullptr);
+    if (rc.SetLayoutMerge)      vkDestroyDescriptorSetLayout(device, rc.SetLayoutMerge, nullptr);
     if (rc.SetLayoutCascade)    vkDestroyDescriptorSetLayout(device, rc.SetLayoutCascade, nullptr);
     if (rc.SetLayoutSparse)     vkDestroyDescriptorSetLayout(device, rc.SetLayoutSparse, nullptr);
 
     rc.DummyBuffer = VK_NULL_HANDLE; rc.DummyMemory = VK_NULL_HANDLE;
     rc.BuildPipeline = VK_NULL_HANDLE; rc.BuildPipelineLayout = VK_NULL_HANDLE;
+    rc.MergePipeline = VK_NULL_HANDLE; rc.MergePipelineLayout = VK_NULL_HANDLE;
     rc.DescriptorPool = VK_NULL_HANDLE;
+    rc.SetLayoutMerge = VK_NULL_HANDLE;
     rc.SetLayoutCascade = VK_NULL_HANDLE; rc.SetLayoutSparse = VK_NULL_HANDLE;
     rc.HasSDF = false;
     rc.Ctx = nullptr;

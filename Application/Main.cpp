@@ -1,10 +1,10 @@
-// Application/Main.cpp — Phase 10
+﻿// Application/Main.cpp â€” Phase 10
 // Phase 9 added the multi-instance grid + per-submesh material binding + click
 // picking. Phase 10 adds the shadow plugin chain (IShadowAlgorithm) + the
 // compute lighting pass. LightingPass composes Karis/Schlick/Smith + IBL +
 // SDF cone shadows into
 // LightHDR; the GBufferPreview Lit mode samples that. Frame ordering is now
-// Sky → Grid → GBuffer → PickingCopy → Shadow → Lighting → Preview → ImGui.
+// Sky â†’ Grid â†’ GBuffer â†’ PickingCopy â†’ Shadow â†’ Lighting â†’ Preview â†’ ImGui.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
@@ -103,7 +103,7 @@ void DrawSkyPanel(RS::SkySettings& s) {
         ImGui::TextUnformatted("Sun disc (in sky cube)");
         ImGui::ColorEdit3 ("Sun colour",     &s.SunColor.x);
         ImGui::SliderFloat("Sun intensity",  &s.SunIntensity,    0.0f, 32.0f);
-        ImGui::SliderFloat("Sun angular °",  &s.SunAngularSizeDeg, 0.1f, 8.0f);
+        ImGui::SliderFloat("Sun angular Â°",  &s.SunAngularSizeDeg, 0.1f, 8.0f);
         ImGui::TextDisabled("Edits re-bake IBL cubemaps (~sub-ms each).");
     }
     ImGui::End();
@@ -114,7 +114,7 @@ void DrawShadowsPanel(RS::IShadowAlgorithm& active) {
     ImGui::SetNextWindowSize(ImVec2(320.0f, 320.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Shadows")) {
         ImGui::TextUnformatted("SDF Cone");
-        ImGui::TextDisabled("Cone-trace soft shadows against the active mesh SDF —\n"
+        ImGui::TextDisabled("Cone-trace soft shadows against the active mesh SDF â€”\n"
                             "bake one in the SDF Baker panel first.");
         ImGui::Separator();
         active.DrawImGuiParams();
@@ -136,9 +136,18 @@ void DrawTonemapPanel(RS::TonemapSettings& t) {
     ImGui::End();
 }
 
-void DrawDebugPanel(RS::GBufferPreviewSettings& preview) {
+struct RcDebugSettings {
+    bool BuildEnabled   = true;
+    bool ShowDebugSlice = true;
+    int  CascadeIndex   = 0;
+    int  SliceZ         = 0;
+};
+
+void DrawDebugPanel(RS::GBufferPreviewSettings& preview,
+                    RcDebugSettings& rcDebug,
+                    const RS::RadianceCascades* rcGi) {
     ImGui::SetNextWindowPos (ImVec2(960.0f, 170.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(300.0f, 120.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330.0f, 250.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Debug")) {
         static const char* kModeLabels[] = {
             "Lit preview", "Albedo", "World normal", "Rough+Metal+F0",
@@ -150,6 +159,47 @@ void DrawDebugPanel(RS::GBufferPreviewSettings& preview) {
             preview.Mode = static_cast<RS::GBufferPreviewMode>(mode);
         }
         ImGui::TextDisabled("Choose which GBuffer channel paints over the grid.");
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Radiance Cascades");
+        if (!rcGi || rcGi->CascadeCount == 0) {
+            bool disabled = false;
+            ImGui::BeginDisabled();
+            ImGui::Checkbox("Build RC atlas", &disabled);
+            ImGui::Checkbox("Show RC atlas slice", &disabled);
+            ImGui::SliderInt("Cascade", &rcDebug.CascadeIndex, 0, 0);
+            ImGui::SliderInt("Slice Z", &rcDebug.SliceZ, 0, 0);
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Launch with -rcgi to allocate RC debug resources.");
+        } else {
+            const int maxCascade = static_cast<int>(rcGi->CascadeCount) - 1;
+            rcDebug.CascadeIndex = std::clamp(rcDebug.CascadeIndex, 0, maxCascade);
+
+            const RS::CascadeAtlas& atlas =
+                rcGi->Atlases[static_cast<uint32_t>(rcDebug.CascadeIndex)];
+            const int maxSlice = atlas.Extent.z > 0
+                ? static_cast<int>(atlas.Extent.z) - 1
+                : 0;
+            rcDebug.SliceZ = std::clamp(rcDebug.SliceZ, 0, maxSlice);
+
+            ImGui::Checkbox("Build RC atlas", &rcDebug.BuildEnabled);
+            ImGui::Checkbox("Show RC atlas slice", &rcDebug.ShowDebugSlice);
+            ImGui::BeginDisabled(!rcDebug.ShowDebugSlice);
+            if (ImGui::SliderInt("Cascade", &rcDebug.CascadeIndex, 0, maxCascade)) {
+                rcDebug.CascadeIndex = std::clamp(rcDebug.CascadeIndex, 0, maxCascade);
+            }
+            const RS::CascadeAtlas& selected =
+                rcGi->Atlases[static_cast<uint32_t>(rcDebug.CascadeIndex)];
+            const int selectedMaxSlice = selected.Extent.z > 0
+                ? static_cast<int>(selected.Extent.z) - 1
+                : 0;
+            rcDebug.SliceZ = std::clamp(rcDebug.SliceZ, 0, selectedMaxSlice);
+            ImGui::SliderInt("Slice Z", &rcDebug.SliceZ, 0, selectedMaxSlice);
+            ImGui::EndDisabled();
+            ImGui::Text("Atlas: %ux%ux%u",
+                        selected.Extent.x, selected.Extent.y, selected.Extent.z);
+            ImGui::Text("SDF: %s", rcGi->HasSDF ? "resident" : "none");
+        }
     }
     ImGui::End();
 }
@@ -185,7 +235,7 @@ void DrawMatcapPanel(RS::MatcapSettings& m) {
         ImGui::TextUnformatted("Output");
         ImGui::ColorEdit3 ("Tint",     &m.Tint.x);
         ImGui::SliderFloat("Exposure", &m.Exposure, 0.0f, 4.0f);
-        ImGui::TextDisabled("Switch Debug → Matcap to view.");
+        ImGui::TextDisabled("Switch Debug â†’ Matcap to view.");
     }
     ImGui::End();
 }
@@ -210,7 +260,7 @@ glm::mat4 CellTransform(int row, int col, int n,
 // Diff the requested grid against the slot table. Slot (r, c) keeps its
 // instance handle (and therefore its material bindings) if (r, c) survives
 // the resize; cells outside the new range are destroyed, cells newly inside
-// are inscribed. `forceReseed` clears everything first — the "Reload
+// are inscribed. `forceReseed` clears everything first â€” the "Reload
 // ShaderBall" button uses it.
 void RebuildShaderBallGrid(RS::Scene& scene, std::vector<RS::InstanceHandle>& slots,
                            int& currentN, int requestedN,
@@ -269,7 +319,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     constexpr uint32_t kHeight = 720;
 
     RS::Win32Host window;
-    if (!window.Create(hInstance, L"Rendering Subsystem — Phase 9", kWidth, kHeight)) {
+    if (!window.Create(hInstance, L"Rendering Subsystem â€” Phase 9", kWidth, kHeight)) {
         RS_LOG_ERROR("Win32Host::Create failed");
         return 1;
     }
@@ -341,7 +391,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     std::unique_ptr<RS::IShadowAlgorithm> shadow = std::make_unique<RS::SDFConeShadow>();
     shadow->Initialize(vk, RS::OffscreenFormatDepth(), { 0, 0 });
 
-    // Phase 13.5 — per-instance inverse-model SSBO ring. Fixes the SDF-shadow
+    // Phase 13.5 â€” per-instance inverse-model SSBO ring. Fixes the SDF-shadow
     // coord-space mismatch (SDF baked in mesh-local; pixels are in world).
     // Bound at SDFCone set=2 binding 4.
     RS::InstanceXformBuffer instanceXforms;
@@ -357,7 +407,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     };
     pushInstanceXformsIfSDFCone();
 
-    // ---- Radiance Cascades GI (rewrite #2), pass 1 — gated on -rcgi --------
+    // ---- Radiance Cascades GI (rewrite #2), pass 1 â€” gated on -rcgi --------
     // When enabled, the debug blit overwrites the swapchain with c0's atlas
     // slice so we can SEE whether the relight march produced radiance before
     // any merge pass exists. The normal render path is untouched when off.
@@ -441,7 +491,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RebuildShaderBallGrid(scene, gridSlots, gridCurrentN, /*requested*/ 3,
                           shaderBall, aabbMin, aabbMax, /*forceReseed*/ false);
 
-    // Phase 11.5 — vast checker floor as a real GBuffer mesh. Shadows from any
+    // Phase 11.5 â€” vast checker floor as a real GBuffer mesh. Shadows from any
     // SDF cone shadows sample it through the GBuffer like the other scene geometry.
     RS::FloorPlaneDesc floorDesc{};
     floorDesc.HalfExtent = 500.0f;
@@ -458,7 +508,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     }
     // Scale-reference sphere: a 0.5m-radius ball hovering above the first
     // ShaderBall so the working world scale is visible (the ShaderBall is
-    // authored in cm and scaled down 100x — easy to misjudge probe spacing
+    // authored in cm and scaled down 100x â€” easy to misjudge probe spacing
     // without a known-size reference). Placed over grid cell (0,0).
     {
         RS::ScaleRefSphereDesc sphereDesc{};
@@ -492,6 +542,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RS::GridSettings            gridSettings;
     RS::GBufferMaterial         legacyMaterial;       // soon-to-die Phase 6 fallback
     RS::GBufferPreviewSettings  previewSettings;
+    RcDebugSettings             rcDebug;
     RS::SkySettings             skySettings;
     RS::PanelSelection          panelSel;
     RS::SdfBakerState           sdfBaker;
@@ -517,7 +568,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
 
         // Dense load is still attempted: the dense view drives the SDFSlice
         // debug viewer's legacy "Dense .rsdf" mode and seeds the CPU slice
-        // preview (sparse → CPU decode lands in Phase 15g-follow-on). On a
+        // preview (sparse â†’ CPU decode lands in Phase 15g-follow-on). On a
         // pure-sparse machine the dense file is just absent and this no-ops.
         bool denseHit = RS::GlobalSDFTryLoadFromCache(globalSdf, vk, shaderBall,
                                                      kShaderBallPath, bootRes);
@@ -553,11 +604,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         if (sparseHit && denseHit) {
             RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (sparse + dense)", bootRes);
         } else if (sparseHit) {
-            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (sparse only — legacy dense absent)", bootRes);
+            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (sparse only â€” legacy dense absent)", bootRes);
         } else if (denseHit) {
-            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (dense only — bake to produce .rsdfvdb)", bootRes);
+            RS_LOG_INFO("Phase 15g: SDF cache hit for ShaderBall at %u^3 (dense only â€” bake to produce .rsdfvdb)", bootRes);
         } else {
-            RS_LOG_INFO("Phase 15g: no SDF cache for ShaderBall — open the SDF Baker window");
+            RS_LOG_INFO("Phase 15g: no SDF cache for ShaderBall â€” open the SDF Baker window");
         }
     }
 
@@ -607,7 +658,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::DrawMaterialsPanel(panelSel, materials,
                                RS::SceneInstancesMut(scene),
                                shaderBall, scene);
-        DrawDebugPanel        (previewSettings);
+        DrawDebugPanel        (previewSettings, rcDebug, rcGiEnabled ? &rcGi : nullptr);
         DrawMatcapPanel       (previewSettings.Matcap);
         DrawTonemapPanel      (tonemapSettings);
         RS::PerfWidgetDraw    (perfWidget, perfTimers, vk.FrameIndex);
@@ -619,7 +670,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         const bool sdfResidencyChanged =
             RS::SdfBakerPanelDrawAndPump(sdfBaker, vk, globalSdf, scene);
 
-        // Helper — push the active resident SDF (or dummy) into both the
+        // Helper â€” push the active resident SDF (or dummy) into both the
         // preview pass and the shadow algo if it's currently SDFConeShadow.
         auto pushSdfToConsumers = [&]() {
             activeSdfMesh = sdfBaker.TargetMesh;
@@ -640,7 +691,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             if (rcGiEnabled) {
                 RS::RadianceCascadesSetSDF(rcGi, rs, hasSparse, /*instanceIndex*/ 0u);
             }
-            // Phase 15f — also wire sparse SSBOs into the debug-slice preview.
+            // Phase 15f â€” also wire sparse SSBOs into the debug-slice preview.
             // Falls back to the always-bound dummy when no sparse residency exists.
             RS::GBufferPreviewSetSparseSDF(preview, vk,
                                            hasSparse ? rs->IndexBuffer : VK_NULL_HANDLE,
@@ -676,7 +727,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // The fence wait inside VulkanContextBeginFrame already gated readback.
         RS::PerfTimersBeginFrame(perfTimers, vk, frame.Cmd, frame.FrameSlot);
 
-        // Phase 9 picking — BeginFrame has just waited this slot's fence so
+        // Phase 9 picking â€” BeginFrame has just waited this slot's fence so
         // the previous-cycle copy is GPU-complete and the host-mapped pixel
         // is safe to read.
         uint32_t pickInst = 0, pickSub = 0;
@@ -767,7 +818,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // Pass the SDF target mesh + the first live grid ball as the "anchor"
         // so non-ShaderBall instances (the floor) route to a correctly-scaled
         // invModel instead of identity. Without this, the floor traces in
-        // world meters against the cm-AABB and the shadow appears 100× too
+        // world meters against the cm-AABB and the shadow appears 100Ã— too
         // large. Multi-ball floor shadows land with multi-mesh SDF (Phase 14b/16).
         RS::InstanceHandle sdfAnchorInstance = 0;
         for (RS::InstanceHandle h : gridSlots) {
@@ -776,14 +827,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::InstanceXformBufferRefresh(instanceXforms, frame.FrameSlot, scene,
                                        activeSdfMesh, sdfAnchorInstance);
 
-        // RCGI pass 1: dispatch rc_build per cascade now that this slot's xform
-        // ring is current. Leaves all atlases in GENERAL (debug blit reads c0).
-        if (rcGiEnabled) {
+        // RCGI passes: dispatch rc_build per cascade now that this slot's xform
+        // ring is current, then merge cascades C-2..0. Leaves all atlases in
+        // GENERAL (debug blit reads them).
+        if (rcGiEnabled && rcDebug.BuildEnabled) {
             RS::RadianceCascadesRecordBuild(
                 rcGi, frame.Cmd, frame.FrameSlot,
                 view.EyePositionWorld,
                 previewSettings.SunDirection,
                 glm::vec3(previewSettings.SunIntensity));
+            RS::RadianceCascadesRecordMerge(rcGi, frame.Cmd, frame.FrameSlot);
         }
 
         RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Shadow);
@@ -814,18 +867,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                                   view, previewSettings, sdfSliceState);
         RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::Preview);
 
-        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
-        RS::ImGuiContextRSRender (gui,  vk, frame.Cmd, frame.ImageIndex);
-        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
-
-        // RCGI debug: blit c0's Z-slice over the swapchain image. This OVERWRITES
-        // the rendered scene + ImGui on purpose — first-light check that the atlas
-        // holds radiance. The swapchain image is COLOR_ATTACHMENT_OPTIMAL here
-        // (BeginFrame/ImGui); RecordDebugSlice does no destination transitions, so
-        // we bracket it: -> TRANSFER_DST for the blit, then BACK to
-        // COLOR_ATTACHMENT_OPTIMAL because VulkanContextEndFrame's internal barrier
-        // expects that as its oldLayout before transitioning to PRESENT_SRC_KHR.
-        if (rcGiEnabled) {
+        // RCGI debug: blit the selected atlas Z-slice over the scene, then draw
+        // ImGui after it so the debug controls stay reachable while inspecting.
+        // The swapchain image is COLOR_ATTACHMENT_OPTIMAL after the preview pass;
+        // bracket the blit to TRANSFER_DST and back so ImGui can load from it.
+        if (rcGiEnabled && rcDebug.ShowDebugSlice) {
             VkImage swap = vk.SwapchainImages[frame.ImageIndex];
 
             VkImageMemoryBarrier toDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -843,7 +889,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
 
             RS::RadianceCascadesRecordDebugSlice(
                 rcGi, frame.Cmd, swap, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                vk.SwapchainExtent.width, vk.SwapchainExtent.height, /*sliceZ*/ 0u);
+                vk.SwapchainExtent.width, vk.SwapchainExtent.height,
+                static_cast<uint32_t>(rcDebug.CascadeIndex),
+                static_cast<uint32_t>(rcDebug.SliceZ));
 
             VkImageMemoryBarrier toColor = toDst;
             toColor.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -854,6 +902,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toColor);
         }
+
+        RS::PerfTimersBeginPass(perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
+        RS::ImGuiContextRSRender (gui,  vk, frame.Cmd, frame.ImageIndex);
+        RS::PerfTimersEndPass  (perfTimers, frame.Cmd, frame.FrameSlot, RS::PerfPass::ImGuiDraw);
 
         RS::VulkanContextEndFrame(vk,   frame);
     }

@@ -74,6 +74,16 @@ struct RcLightingParams {
 };
 static_assert(sizeof(RcLightingParams) == 64, "RcLightingParams must stay 64 bytes (std140, matches rc_build.comp)");
 
+// std140 UBO at set 0 binding 0 of the merge pass. Mirrors MergeParamsBuf in rc_merge.comp (5 x vec4/uvec4 = 80 bytes).
+struct RcMergeParams {
+    glm::vec4  ProbeOriginN;      // xyz = snapped world min corner cascade N; w = probe pitch N
+    glm::vec4  ProbeOriginUpper;  // xyz = snapped world min corner cascade N+1; w = probe pitch Upper
+    glm::vec4  IntervalEndN;      // x = IntervalEnd N (metres); yzw unused
+    glm::uvec4 DimsN;             // x = octSide N, y = probeAxis N, z = atlasWidth N, .w unused
+    glm::uvec4 DimsUpper;         // x = octSide Upper, y = probeAxis Upper, z = atlasWidth Upper, .w unused
+};
+static_assert(sizeof(RcMergeParams) == 80, "RcMergeParams must stay 80 bytes (std140, matches rc_merge.comp)");
+
 // std140 UBO at set 0 binding 2. Mirrors SparseSDFParams in sdf_sparse.glsl and
 // SDFConeShadow::SparseParams (pinned 48 bytes) — fill it the same way.
 struct RcSparseParams {
@@ -113,6 +123,12 @@ struct RcFrameResources {
 
     VkDescriptorSet SparseSet = VK_NULL_HANDLE;                          // set 0 (shared across cascades this frame)
     std::array<VkDescriptorSet, kMaxCascades> CascadeSets{};            // set 1 (one per cascade, distinct atlas)
+
+    // Merge pass: per-cascade MergeParams UBO ring + descriptor sets (one per cascade, distinct atlas pair).
+    VkBuffer       MergeParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory MergeParamsMemory = VK_NULL_HANDLE;
+    void*          MergeParamsMapped = nullptr;
+    std::array<VkDescriptorSet, kMaxCascades> MergeSets{};              // set 0 (merge UBO + atlas pair per cascade)
 };
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -134,8 +150,17 @@ struct RadianceCascades {
     VkDescriptorSetLayout SetLayoutCascade    = VK_NULL_HANDLE;   // set 1
     VkDescriptorPool      DescriptorPool      = VK_NULL_HANDLE;
 
+    // rc_merge pipeline (Phase 2: cascade merge pass).
+    VkPipeline            MergePipeline       = VK_NULL_HANDLE;
+    VkPipelineLayout      MergePipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout SetLayoutMerge      = VK_NULL_HANDLE;   // set 0 (merge UBO + images)
+
     std::array<RcFrameResources, VulkanContext::kFramesInFlight> Frames{};
     VkDeviceSize          CascadeBuildStride  = 0;                // [B] aligned stride between cascade UBO slots
+    VkDeviceSize          MergeParamsStride   = 0;                // [B] aligned stride between merge UBO slots
+
+    // Per-frame snapped origins cached by RecordBuild for use by RecordMerge.
+    std::array<glm::vec3, kMaxCascades> LastSnappedOrigins{};
 
     // Sparse residency snapshot (pushed via RadianceCascadesSetSDF, mirrors SDFConeShadow).
     bool         HasSDF       = false;
@@ -200,7 +225,15 @@ void RadianceCascadesRecordBuild(RadianceCascades& rc,
                                  const glm::vec3& sunDirectionWorld,
                                  const glm::vec3& sunColour);
 
-// Debug: blit one Z-slice of the c0 atlas into a destination colour image. Proves
+// Record pass 2 for the active frame: merge cascades from C-2 down to 0, compositing
+// the upper cascade's far-field radiance into each lower cascade via software trilinear
+// parallax interpolation. Must be called after RadianceCascadesRecordBuild in the same
+// command buffer.
+void RadianceCascadesRecordMerge(RadianceCascades& rc,
+                                 VkCommandBuffer cmd,
+                                 uint32_t frameSlot);
+
+// Debug: blit one Z-slice of a cascade atlas into a destination colour image. Proves
 // the atlas has non-zero texels independent of any merge/compose logic. Note:
 // blitting rgba16f HDR to an LDR target clips/looks dim — black here but light in
 // a later merge means suspect the blit target's format, not the trace.
@@ -210,6 +243,7 @@ void RadianceCascadesRecordDebugSlice(RadianceCascades& rc,
                                       VkImageLayout destinationLayout,
                                       uint32_t destinationWidth,
                                       uint32_t destinationHeight,
+                                      uint32_t cascadeIndex,
                                       uint32_t sliceZ);
 
 } // namespace RS

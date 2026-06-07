@@ -1,0 +1,163 @@
+/*====================================================================================================================================
+                                                          RC_MERGE.COMP
+====================================================================================================================================*/
+// Radiance Cascades pass 2: backward merge, cascade N <- cascade N+1.
+// For every non-occluded texel in cascade N, trilinearly gather cascade N+1 with per-upper-probe
+// parallax correction: the sample direction for each of the 8 surrounding upper probes is computed
+// from that probe's world position toward cascade N's ray interval-end point (PEnd), not the fixed
+// traced direction. Eliminates the blur/occlusion-leaking of naive trilinear interpolation.
+//
+// CRITICAL: uCascadeUpper MUST NOT be sampled via hardware sampler3D.  The atlas packs oct tiles of
+// adjacent probes contiguously in X/Y — a hardware filter kernel bleeds across tile boundaries.
+// All fetches are manual bilinear within one probe's tile with explicit boundary clamping.
+//
+// Descriptor contract (set 0 only — merge does not need the sparse SDF):
+//   binding 0 = MergeParamsBuf  UBO     (CascadeMergeParams, 80 bytes)
+//   binding 1 = uCascadeN       image3D (rgba16f, GENERAL, read + write)
+//   binding 2 = uCascadeUpper   image3D (rgba16f, GENERAL, readonly)
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "include/octahedral.glsl"          // OctEncode / OctDecode / DirectionFromOctTexel
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+/*====================================================================================================================================
+                                                            MERGE UBO
+====================================================================================================================================*/
+
+layout(set = 0, binding = 0) uniform MergeParamsBuf
+{
+    vec4  ProbeOriginN;      // [m]  xyz = region min corner cascade N; w = probe pitch N
+    vec4  ProbeOriginUpper;  // [m]  xyz = region min corner cascade N+1; w = probe pitch Upper
+    vec4  IntervalEndN;      // [m]  x = intervalEnd N; yzw = pad
+    uvec4 DimsN;             // [-]  x = octSide N; y = probeAxis N; z = atlasWidth N (probeAxis*octSide); w = pad
+    uvec4 DimsUpper;         // [-]  x = octSide Upper; y = probeAxis Upper; z = atlasWidth Upper; w = pad
+} Params;
+
+// Cascade N: read existing rc_build result (rgb = local radiance, a = transmittance), write back merged.
+layout(set = 0, binding = 1, rgba16f) uniform image3D uCascadeN;
+
+// Cascade N+1: read-only this pass; guarded by caller's image barrier before each dispatch.
+layout(set = 0, binding = 2, rgba16f) uniform readonly image3D uCascadeUpper;
+
+/*====================================================================================================================================
+                                                     UPPER PROBE FETCH
+====================================================================================================================================*/
+
+//------------------------------------------------------------------------------
+// software bilinear oct-tile fetch — one upper probe, one parallax direction
+//------------------------------------------------------------------------------
+// Bilinearly samples one probe's octahedral tile within the upper atlas without
+// crossing tile boundaries. OctSI x OctSI tile at atlas offset (px*OctSI, py*OctSI, pz).
+vec3 FetchUpperRadiance(uvec3 ProbUpper, vec3 Dir)
+{
+    const int   OctSI = int(Params.DimsUpper.x);    // [-] oct side of upper cascade
+    const float OctF  = float(OctSI);
+
+    vec2 OctUV = OctEncode(Dir);                     // [0,1]^2 - direction -> oct UV
+    vec2 TF    = OctUV * OctF;                       // [0, OctF] - float tile-local coords
+
+    // Lower-left corner of 2x2 bilinear kernel; clamped so THi = TLo+1 <= OctSI-1 always.
+    ivec2 TLo  = clamp(ivec2(floor(TF - 0.5)), ivec2(0), ivec2(OctSI - 2)); // [-] bilinear lo texel
+    ivec2 THi  = TLo + ivec2(1);                                             // [-] bilinear hi texel
+    vec2  Frac = clamp(TF - 0.5 - vec2(TLo), vec2(0.0), vec2(1.0));         // [-] bilinear weights [0,1]
+
+    // Atlas base for this probe (A5 invariant: probe (px,py,pz) owns tile at (px*OctSide, py*OctSide, pz)).
+    int BX = int(ProbUpper.x) * OctSI;  // [px] atlas X base
+    int BY = int(ProbUpper.y) * OctSI;  // [px] atlas Y base
+    int BZ = int(ProbUpper.z);          // [px] atlas Z (bare probe depth index)
+
+    vec3 C00 = imageLoad(uCascadeUpper, ivec3(BX + TLo.x, BY + TLo.y, BZ)).rgb;
+    vec3 C10 = imageLoad(uCascadeUpper, ivec3(BX + THi.x, BY + TLo.y, BZ)).rgb;
+    vec3 C01 = imageLoad(uCascadeUpper, ivec3(BX + TLo.x, BY + THi.y, BZ)).rgb;
+    vec3 C11 = imageLoad(uCascadeUpper, ivec3(BX + THi.x, BY + THi.y, BZ)).rgb;
+
+    return mix(mix(C00, C10, Frac.x), mix(C01, C11, Frac.x), Frac.y);
+}
+
+/*====================================================================================================================================
+                                                               MAIN
+====================================================================================================================================*/
+
+void main()
+{
+    const uvec3 TexelN  = gl_GlobalInvocationID;
+    const uint  OctSideN = Params.DimsN.x;   // [-] oct side of cascade N
+    const uint  ProbeAx  = Params.DimsN.y;   // [-] probes per axis, cascade N
+    const uint  AtlasW   = Params.DimsN.z;   // [px] atlas width/height = ProbeAx * OctSideN
+
+    // Over-dispatch guard: 8x8 tile ceil may overshoot atlas edges.
+    if (TexelN.x >= AtlasW || TexelN.y >= AtlasW || TexelN.z >= ProbeAx) return;
+
+    // Load rc_build output for this texel (rgb = local radiance, a = transmittance).
+    vec4 Local = imageLoad(uCascadeN, ivec3(TexelN));
+
+    // No upper-cascade light propagates through zero transmittance.
+    if (Local.a <= 0.001) return; // End if (transmittance occluded)
+
+    //------------------------------------------------------------------------------
+    // decode probe index + direction from flattened atlas (A5 invariant)
+    //------------------------------------------------------------------------------
+    const uint ProbeX = TexelN.x / OctSideN;    // [-] probe col
+    const uint DirX   = TexelN.x % OctSideN;    // [-] oct texel col within tile
+    const uint ProbeY = TexelN.y / OctSideN;    // [-] probe row
+    const uint DirY   = TexelN.y % OctSideN;    // [-] oct texel row within tile
+    const uint ProbeZ = TexelN.z;               // [-] probe depth (bare Z, A5)
+
+    // Probe world-space centre (matches rc_build: origin + (idx + 0.5) * pitch).
+    const float PitchN  = Params.ProbeOriginN.w;                                   // [m]
+    const vec3  ProbeNW = Params.ProbeOriginN.xyz
+                        + (vec3(ProbeX, ProbeY, ProbeZ) + 0.5) * PitchN;           // [m]
+
+    // World-space direction for this oct texel centre.
+    const vec3 Dir = DirectionFromOctTexel(int(DirX), int(DirY), int(OctSideN));   // [-] unit
+
+    // Interval-end point of this cascade N ray (parallax anchor in world space).
+    const vec3 PEnd = ProbeNW + Dir * Params.IntervalEndN.x;                       // [m]
+
+    //------------------------------------------------------------------------------
+    // trilinear 2x2x2 gather over surrounding upper-cascade probes with parallax
+    //------------------------------------------------------------------------------
+    const float PitchU   = Params.ProbeOriginUpper.w;         // [m] upper probe pitch
+    const vec3  OriginU  = Params.ProbeOriginUpper.xyz;        // [m] upper region origin
+    const int   ProbeAxU = int(Params.DimsUpper.y);            // [-] upper probes per axis
+
+    // Continuous upper-grid index for PEnd (probe centres sit at integer idx + 0.5).
+    const vec3  UpperFlt = (PEnd - OriginU) / PitchU - 0.5;
+
+    // Integer lower and upper corners of the trilinear cell, clamped to valid grid.
+    const ivec3 B0 = clamp(ivec3(floor(UpperFlt)), ivec3(0), ivec3(ProbeAxU - 1)); // [-] lo corner
+    const ivec3 B1 = min(B0 + ivec3(1),            ivec3(ProbeAxU - 1));            // [-] hi corner
+    const vec3  Fr = clamp(UpperFlt - vec3(B0),    vec3(0.0), vec3(1.0));           // [-] trilinear weights
+
+    vec3 UpperRadiance = vec3(0.0); // [W·m⁻²·sr⁻¹] accumulated upper radiance
+
+    for (int I = 0; I < 8; ++I)
+    {
+        // Select probe grid index per axis for this corner.
+        const int XI = ((I & 1)       == 0) ? B0.x : B1.x;
+        const int YI = (((I >> 1) & 1) == 0) ? B0.y : B1.y;
+        const int ZI = (((I >> 2) & 1) == 0) ? B0.z : B1.z;
+
+        // World-space centre of this upper probe.
+        const vec3 PUpperW = OriginU + (vec3(XI, YI, ZI) + 0.5) * PitchU;    // [m]
+
+        // Parallax direction: from this upper probe toward the cascade N interval endpoint.
+        const vec3 ParDir = normalize(PEnd - PUpperW);                        // [-] unit
+
+        // Trilinear weight for this corner.
+        const float WX = ((I & 1)       == 0) ? (1.0 - Fr.x) : Fr.x;
+        const float WY = (((I >> 1) & 1) == 0) ? (1.0 - Fr.y) : Fr.y;
+        const float WZ = (((I >> 2) & 1) == 0) ? (1.0 - Fr.z) : Fr.z;
+
+        UpperRadiance += FetchUpperRadiance(uvec3(XI, YI, ZI), ParDir) * (WX * WY * WZ);
+    } // End for (trilinear 8-probe parallax gather)
+
+    //------------------------------------------------------------------------------
+    // composite: local radiance + transmittance-weighted upper field, preserve transmittance
+    //------------------------------------------------------------------------------
+    imageStore(uCascadeN, ivec3(TexelN),
+               vec4(Local.rgb + Local.a * UpperRadiance, Local.a));
+}
