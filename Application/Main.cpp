@@ -138,7 +138,7 @@ void DrawTonemapPanel(RS::TonemapSettings& t) {
 
 struct RcDebugSettings {
     bool BuildEnabled   = true;
-    bool ShowDebugSlice = true;
+    bool ShowDebugSlice = false;
     int  CascadeIndex   = 0;
     int  SliceZ         = 0;
 };
@@ -170,7 +170,7 @@ void DrawDebugPanel(RS::GBufferPreviewSettings& preview,
             ImGui::SliderInt("Cascade", &rcDebug.CascadeIndex, 0, 0);
             ImGui::SliderInt("Slice Z", &rcDebug.SliceZ, 0, 0);
             ImGui::EndDisabled();
-            ImGui::TextDisabled("Launch with -rcgi to allocate RC debug resources.");
+            ImGui::TextDisabled("RC resource allocation failed; see log.");
         } else {
             const int maxCascade = static_cast<int>(rcGi->CascadeCount) - 1;
             rcDebug.CascadeIndex = std::clamp(rcDebug.CascadeIndex, 0, maxCascade);
@@ -407,26 +407,26 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     };
     pushInstanceXformsIfSDFCone();
 
-    // ---- Radiance Cascades GI (rewrite #2), pass 1 â€” gated on -rcgi --------
-    // When enabled, the debug blit overwrites the swapchain with c0's atlas
-    // slice so we can SEE whether the relight march produced radiance before
-    // any merge pass exists. The normal render path is untouched when off.
-    const bool rcGiEnabled = (std::wcsstr(GetCommandLineW(), L"-rcgi") != nullptr);
+    // ---- Radiance Cascades GI (rewrite #2) ---------------------------------
+    // Resources are allocated unconditionally so the feature is driven entirely
+    // by the in-app Debug panel toggles (Build RC atlas / Show RC atlas slice)
+    // instead of a launch flag. rcGiReady is false only if GPU allocation fails;
+    // the toggles then stay disabled. The debug blit (off by default) overwrites
+    // the swapchain with a chosen atlas slice for first-light inspection.
     RS::RadianceCascades rcGi{};
-    if (rcGiEnabled) {
-        if (!RS::RadianceCascadesInitialize(rcGi, vk)) {
-            RS_LOG_ERROR("RadianceCascadesInitialize failed");
-            return 14;
-        }
-        if (!RS::RadianceCascadesConstructAtlases(rcGi, vk)) {
-            RS_LOG_ERROR("RadianceCascadesConstructAtlases failed");
-            return 15;
-        }
+    bool rcGiReady = true;
+    if (!RS::RadianceCascadesInitialize(rcGi, vk)) {
+        RS_LOG_ERROR("RadianceCascadesInitialize failed; RC disabled this session");
+        rcGiReady = false;
+    } else if (!RS::RadianceCascadesConstructAtlases(rcGi, vk)) {
+        RS_LOG_ERROR("RadianceCascadesConstructAtlases failed; RC disabled this session");
+        rcGiReady = false;
+    } else {
         // Same per-instance inverse-model ring the cone shadow uses; RC reads
         // InvModel[InstanceIndex] to map each probe ray world -> mesh-local.
         RS::RadianceCascadesSetInstanceXformBuffer(
             rcGi, instanceXforms.Buffers.data(), RS::InstanceXformBuffer::kBytes);
-        RS_LOG_INFO("RCGI enabled: %u cascades constructed", rcGi.CascadeCount);
+        RS_LOG_INFO("RCGI ready: %u cascades constructed", rcGi.CascadeCount);
     }
 
     RS::LightingPass lighting;
@@ -595,7 +595,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                 // RCGI: same residency, pushed the SDFConeShadow way. instanceIndex 0
                 // because InstanceXformBufferRefresh packs the single SDF-mesh anchor
                 // contiguously from slot 0 (it is the only resident sparse mesh).
-                if (rcGiEnabled) {
+                if (rcGiReady) {
                     RS::RadianceCascadesSetSDF(rcGi, rs, true, /*instanceIndex*/ 0u);
                 }
             }
@@ -658,7 +658,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         RS::DrawMaterialsPanel(panelSel, materials,
                                RS::SceneInstancesMut(scene),
                                shaderBall, scene);
-        DrawDebugPanel        (previewSettings, rcDebug, rcGiEnabled ? &rcGi : nullptr);
+        DrawDebugPanel        (previewSettings, rcDebug, rcGiReady ? &rcGi : nullptr);
         DrawMatcapPanel       (previewSettings.Matcap);
         DrawTonemapPanel      (tonemapSettings);
         RS::PerfWidgetDraw    (perfWidget, perfTimers, vk.FrameIndex);
@@ -688,7 +688,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
             if (auto* cone = dynamic_cast<RS::SDFConeShadow*>(shadow.get())) {
                 cone->SetSDF(rs, hasSparse);
             }
-            if (rcGiEnabled) {
+            if (rcGiReady) {
                 RS::RadianceCascadesSetSDF(rcGi, rs, hasSparse, /*instanceIndex*/ 0u);
             }
             // Phase 15f â€” also wire sparse SSBOs into the debug-slice preview.
@@ -830,7 +830,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // RCGI passes: dispatch rc_build per cascade now that this slot's xform
         // ring is current, then merge cascades C-2..0. Leaves all atlases in
         // GENERAL (debug blit reads them).
-        if (rcGiEnabled && rcDebug.BuildEnabled) {
+        if (rcGiReady && rcDebug.BuildEnabled) {
             RS::RadianceCascadesRecordBuild(
                 rcGi, frame.Cmd, frame.FrameSlot,
                 view.EyePositionWorld,
@@ -871,7 +871,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // ImGui after it so the debug controls stay reachable while inspecting.
         // The swapchain image is COLOR_ATTACHMENT_OPTIMAL after the preview pass;
         // bracket the blit to TRANSFER_DST and back so ImGui can load from it.
-        if (rcGiEnabled && rcDebug.ShowDebugSlice) {
+        if (rcGiReady && rcDebug.ShowDebugSlice) {
             VkImage swap = vk.SwapchainImages[frame.ImageIndex];
 
             VkImageMemoryBarrier toDst{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -917,7 +917,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RS::LightingPassTerminate (lighting, vk);
     shadow->Terminate         (vk);
     shadow.reset();
-    if (rcGiEnabled) RS::RadianceCascadesTerminate(rcGi, vk);
+    if (rcGiReady) RS::RadianceCascadesTerminate(rcGi, vk);
     RS::InstanceXformBufferTerminate(instanceXforms, vk);
     RS::PickingTerminate(picking, vk);
     RS::GBufferPreviewTerminate(preview, vk);
