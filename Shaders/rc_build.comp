@@ -1,0 +1,182 @@
+/*====================================================================================================================================
+                                                          RC_BUILD.COMP
+====================================================================================================================================*/
+// Radiance Cascades pass 1: per probe, per octahedral direction, march this cascade's disjoint radiance interval
+// [IntervalStart, IntervalEnd] (metres) through the SPARSE SDF in mesh-local space. Hit -> sun*NdotL*vis*albedo
+// (+ambient); miss -> transmittance = 1. Output vec4(rgb, transmittance) per direction-texel into this cascade's atlas.
+//
+// CRITICAL coordinate rule (the "missed every ray" trap): the SDF is baked in mesh-local centimetres; the world is
+// metres. Every ray is transformed world -> mesh-local via invModel BEFORE sampling, and interval lengths are scaled
+// by scaleLocalPerWorld = length(mat3(invModel) * dirWorld). Mirrors lighting_sdfcone.comp exactly.
+//
+// CRITICAL helper split: advance t by the RAY helper (brick-skip), hit-test/normal via the POINT helper. SDF_TraceHitSparse
+// already does this internally — we call it, we do NOT hand-roll the march.
+//
+// Atlas layout invariant (spec A5): the OctSide x OctSide direction tile lives in X and Y only; Z is the bare probe-Z.
+// Probe (px,py,pz) owns texels  X in [px*OctSide .. px*OctSide+OctSide-1],  Y in [py*OctSide ..],  Z == pz.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                   SPARSE SDF HELPERS + BINDINGS
+//------------------------------------------------------------------------------------------------------------------------
+// Ordering mirrors lighting_sdfcone.comp exactly (the proven working reference) and is load-bearing:
+//   1. #include sdf_sparse.glsl  -> defines `struct SparseSDFParams` (do NOT redeclare it; that's a redefinition error)
+//   2. declare the sparse SSBO/UBO bindings (they reference SparseSDFParams, so must come AFTER the include)
+//   3. SDFSPARSE_DEFINE_* macros  -> name the SSBOs declared in step 2
+//   4. #include sdf_trace.glsl + SDFTRACE_DEFINE_SPARSE_HELPERS() -> SDF_TraceHitSparse uses the step-3 helpers
+
+#include "include/sdf_sparse.glsl"   // defines SparseSDFParams + the SDFSPARSE_DEFINE_* macros
+
+// --- set 0: the sparse SDF (three-binding contract, copied from the cone shader's shape; set index is RC's own) ---
+layout(std430, set = 0, binding = 0) readonly buffer SparseIdx  { uint Data[]; } uSparseIdx;   // BrickIndex
+layout(std430, set = 0, binding = 1) readonly buffer SparsePool { uint Data[]; } uSparsePool;  // BrickPool (int16 x2 per uint)
+layout(std140, set = 0, binding = 2) uniform  SparseParamsBuf   { SparseSDFParams P; } uSparseP;
+
+// --- set 0: per-instance world->mesh-local transforms (same SSBO the cone shader binds; RC binds it to its own set) ---
+// std430 array of mat4. invModel = world -> mesh-local. For now we trace a single instance (GridDims.w).
+layout(std430, set = 0, binding = 3) readonly buffer InstanceXforms { mat4 SdfInvModels[]; } uXforms;
+
+SDFSPARSE_DEFINE_HELPER    (uSparseIdx, uSparsePool)   // SDFSparseSampleHelper    (point sampler)
+SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)   // SDFSparseRaySampleHelper (brick-skip ray sampler)
+
+#include "include/sdf_trace.glsl"
+SDFTRACE_DEFINE_SPARSE_HELPERS()                       // SDF_TraceHitSparse + SDF_SoftShadowSparse
+
+#include "include/octahedral.glsl"                     // OctDecode / DirectionFromOctTexel
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                       CONSTANTS
+//------------------------------------------------------------------------------------------------------------------------
+
+// One workgroup thread per (direction-texel-x, direction-texel-y) within ONE probe; Z dispatch walks probes. Local
+// size 8x8 covers up to OctSide=8 in one group; for larger OctSide the dispatch tiles in X/Y (see dispatch note below).
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float HitEpsilonLocal = 0.001;   // [-] - local-units surface threshold (matches SDF_TraceHitSparse)
+const int   MaxTraceSteps   = 64;      // [-] - sphere-trace step cap per ray (tune; sparse skip keeps this cheap)
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                  CASCADE / LIGHTING BINDINGS
+//------------------------------------------------------------------------------------------------------------------------
+
+// Per-cascade constants the build pass needs. Filled by C++ each frame from CascadeDescriptor + CascadePlacement.
+// std140: each member below is aligned per std140 rules — restated explicitly so the C++ side matches byte-for-byte.
+struct CascadeBuildParams
+{
+    vec4  RegionOriginWorld;   // [m]  xyz = world min corner of THIS cascade's probe grid (snapped); .w = ProbePitchWorld
+    vec4  IntervalMetres;      // [m]  x = IntervalStart, y = IntervalEnd, z = minStepWorld, w = ambientScalar
+    uvec4 GridDims;            // [-]  x = ProbeAxisCount, y = OctSide, z = CascadeIndex, w = InstanceIndex (single mesh for now)
+};
+
+// --- set 1: cascade build constants + lighting ---
+layout(std140, set = 1, binding = 0) uniform CascadeBuildBuf { CascadeBuildParams C; } uCascade;
+
+// std140: vec4 SunDirectionWorld (xyz dir TOWARD sun, normalized; .w unused), vec4 SunColour (rgb * intensity; .w unused),
+// vec4 AmbientColour (rgb; .w unused), vec4 SurfaceAlbedo (rgb constant albedo for now; .w unused).
+layout(std140, set = 1, binding = 1) uniform LightingBuf
+{
+    vec4 SunDirectionWorld;
+    vec4 SunColour;
+    vec4 AmbientColour;
+    vec4 SurfaceAlbedo;
+} uLight;
+
+// --- set 1: this cascade's output atlas (rgba16f image3D; .rgb = radiance, .a = transmittance) ---
+layout(set = 1, binding = 2, rgba16f) uniform writeonly image3D uCascadeAtlas;
+
+//------------------------------------------------------------------------------------------------------------------------
+//                                                         MAIN
+//------------------------------------------------------------------------------------------------------------------------
+
+void main()
+{
+    const uint ProbeAxis = uCascade.C.GridDims.x;
+    const uint OctSide   = uCascade.C.GridDims.y;
+
+    // Decode which probe and which octahedral direction-texel this invocation owns.
+    // gl_GlobalInvocationID.z walks the flattened probe grid (px + py*ProbeAxis + pz*ProbeAxis*ProbeAxis).
+    // gl_GlobalInvocationID.xy walks the OctSide x OctSide direction tile of THAT probe.
+    const uint DirectionX = gl_GlobalInvocationID.x;
+    const uint DirectionY = gl_GlobalInvocationID.y;
+    const uint ProbeFlat  = gl_GlobalInvocationID.z;
+
+    if (DirectionX >= OctSide || DirectionY >= OctSide) return;
+
+    const uint ProbeTotal = ProbeAxis * ProbeAxis * ProbeAxis;
+    if (ProbeFlat >= ProbeTotal) return;
+
+    const uint ProbeX = ProbeFlat % ProbeAxis;
+    const uint ProbeY = (ProbeFlat / ProbeAxis) % ProbeAxis;
+    const uint ProbeZ = ProbeFlat / (ProbeAxis * ProbeAxis);
+
+    // Probe world position: region origin + (probeIndex + 0.5) * pitch  (probe sits at cell centre).
+    const float ProbePitch = uCascade.C.RegionOriginWorld.w;
+    const vec3  ProbeWorld  = uCascade.C.RegionOriginWorld.xyz
+                            + (vec3(ProbeX, ProbeY, ProbeZ) + 0.5) * ProbePitch;
+
+    // Octahedral direction (world space) for this texel centre.
+    const vec3 DirectionWorld = DirectionFromOctTexel(int(DirectionX), int(DirectionY), int(OctSide));
+
+    // World -> mesh-local (mirrors lighting_sdfcone.comp). invModel rotates+scales into baked cm space.
+    const uint InstanceIndex   = uCascade.C.GridDims.w;
+    const mat4 InvModel        = uXforms.SdfInvModels[InstanceIndex];
+
+    const vec3  RayOriginLocal     = (InvModel * vec4(ProbeWorld, 1.0)).xyz;
+    const vec3  DirectionLocalRaw  = mat3(InvModel) * DirectionWorld;          // not yet unit
+    const float ScaleLocalPerWorld = length(DirectionLocalRaw);                // ~100 for ShaderBall
+    const vec3  DirectionLocal     = DirectionLocalRaw / max(ScaleLocalPerWorld, 1e-6);
+
+    // Interval [start,end] metres -> local units. This cascade only marches ITS disjoint slice.
+    const float IntervalStartLocal = uCascade.C.IntervalMetres.x * ScaleLocalPerWorld;
+    const float IntervalEndLocal   = uCascade.C.IntervalMetres.y * ScaleLocalPerWorld;
+    const float MinStepLocal       = max(uCascade.C.IntervalMetres.z * ScaleLocalPerWorld, 1e-4);
+
+    // Trace the disjoint interval through the sparse SDF. SDF_TraceHitSparse advances by the RAY helper and
+    // hit-tests/normals via the POINT helper — the correct split, already audited.
+    vec3  HitPositionLocal;
+    vec3  HitNormalLocal;
+    float DistanceTravelledLocal;
+
+    const bool SurfaceHit = SDF_TraceHitSparse(
+        RayOriginLocal, DirectionLocal,
+        IntervalStartLocal, IntervalEndLocal,
+        MaxTraceSteps, MinStepLocal,
+        uSparseP.P,
+        HitPositionLocal, HitNormalLocal, DistanceTravelledLocal);
+
+    // Shade. Minimal but instrumented: hit -> sun*NdotL*albedo + ambient, transmittance 0; miss -> ambient*0, T=1.
+    vec3  Radiance     = vec3(0.0);
+    float Transmittance = 1.0;
+
+    if (SurfaceHit)
+    {
+        // Normal is in mesh-local space; transform back to world for the sun dot. mat3(InvModel) maps world->local,
+        // so its transpose maps local->world for a direction (ignoring non-uniform scale, fine for a unit normal).
+        const vec3 NormalWorld = normalize(transpose(mat3(InvModel)) * HitNormalLocal);
+
+        const vec3  SunDir = normalize(uLight.SunDirectionWorld.xyz);
+        const float NdotL  = max(dot(NormalWorld, SunDir), 0.0);
+
+        // No self-visibility cone here (that's a later refinement); direct hit assumes lit. vis = 1.
+        const vec3 DirectTerm = uLight.SunColour.rgb * NdotL * uLight.SurfaceAlbedo.rgb;
+        const vec3 AmbientTerm = uLight.AmbientColour.rgb * uCascade.C.IntervalMetres.w * uLight.SurfaceAlbedo.rgb;
+
+        Radiance      = DirectTerm + AmbientTerm;
+        Transmittance = 0.0;   // opaque hit fully occludes the far interval for the merge composite
+    }
+    else
+    {
+        // Miss: no radiance from this interval, fully transmissive so the merge can composite the far cascade behind it.
+        Radiance      = vec3(0.0);
+        Transmittance = 1.0;
+    }
+
+    // Write to this cascade's atlas at the probe's owned direction-texel (A5 layout).
+    const ivec3 AtlasTexel = ivec3(int(ProbeX) * int(OctSide) + int(DirectionX),
+                                   int(ProbeY) * int(OctSide) + int(DirectionY),
+                                   int(ProbeZ));
+
+    imageStore(uCascadeAtlas, AtlasTexel, vec4(Radiance, Transmittance));
+}
