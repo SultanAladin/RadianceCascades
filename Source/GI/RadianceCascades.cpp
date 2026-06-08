@@ -169,6 +169,10 @@ static bool CreateUboRings(RadianceCascades& rc) {
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                               frame.MergeParamsBuffer, frame.MergeParamsMemory, &frame.MergeParamsMapped))
             return false;
+        if (!CreateHostBuffer(*rc.Ctx, sizeof(RcResolveParams),
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                              frame.ResolveParamsBuffer, frame.ResolveParamsMemory, &frame.ResolveParamsMapped))
+            return false;
     }
     return true;
 }
@@ -675,6 +679,42 @@ void RadianceCascadesRecordMerge(RadianceCascades& rc, VkCommandBuffer cmd, uint
         const uint32_t groupZ = rc.Levels[c].AtlasDepth;
         vkCmdDispatch(cmd, groupX, groupY, groupZ);
     }
+
+    // Phase 3: fill the resolve UBO (C0 metadata) consumed by the lighting compose.
+    {
+        const Cascades::CascadeDescriptor& levelC0 = rc.Levels[0];
+        const float pitchC0 = Cascades::ResolveBaseProbePitch(rc.Spec);
+
+        RcResolveParams resolve{};
+        resolve.CascadeOrigin   = glm::vec4(rc.LastSnappedOrigins[0], pitchC0);
+        resolve.CascadeInterval = glm::vec4(levelC0.IntervalEnd,
+                                            static_cast<float>(rc.ResolveRayCount), 0.0f, 0.0f);
+        resolve.CascadeDims     = glm::uvec4(levelC0.OctSide, levelC0.ProbeAxisCount,
+                                             levelC0.AtlasWidth, rc.ResolveEnabled ? 1u : 0u);
+        std::memcpy(frame.ResolveParamsMapped, &resolve, sizeof(RcResolveParams));
+    }
+
+    // Phase 3: write->read barrier on C0 so the lighting compose (later in the
+    // same command buffer) reads merged radiance, not a write still in flight.
+    VkImageMemoryBarrier resolveBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    resolveBarrier.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+    resolveBarrier.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+    resolveBarrier.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    resolveBarrier.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    resolveBarrier.image            = rc.Atlases[0].Image;
+    resolveBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &resolveBarrier);
+}
+
+void RadianceCascadesEnumerateResolveBuffers(const RadianceCascades& rc,
+                                             VkBuffer* outBuffersByFrame,
+                                             uint32_t bufferCount) {
+    const uint32_t n = std::min(bufferCount, static_cast<uint32_t>(rc.Frames.size()));
+    for (uint32_t i = 0; i < n; ++i)
+        outBuffersByFrame[i] = rc.Frames[i].ResolveParamsBuffer;
 }
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -741,6 +781,9 @@ void RadianceCascadesTerminate(RadianceCascades& rc, const VulkanContext& ctx) {
         if (frame.MergeParamsMapped)  vkUnmapMemory(device, frame.MergeParamsMemory);
         if (frame.MergeParamsBuffer)  vkDestroyBuffer(device, frame.MergeParamsBuffer, nullptr);
         if (frame.MergeParamsMemory)  vkFreeMemory(device, frame.MergeParamsMemory, nullptr);
+        if (frame.ResolveParamsMapped) vkUnmapMemory(device, frame.ResolveParamsMemory);
+        if (frame.ResolveParamsBuffer) vkDestroyBuffer(device, frame.ResolveParamsBuffer, nullptr);
+        if (frame.ResolveParamsMemory) vkFreeMemory(device, frame.ResolveParamsMemory, nullptr);
         frame = RcFrameResources{};
     }
 

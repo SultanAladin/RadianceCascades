@@ -137,10 +137,11 @@ void DrawTonemapPanel(RS::TonemapSettings& t) {
 }
 
 struct RcDebugSettings {
-    bool BuildEnabled   = true;
-    bool ShowDebugSlice = false;
-    int  CascadeIndex   = 0;
-    int  SliceZ         = 0;
+    bool BuildEnabled     = true;
+    bool ShowDebugSlice   = false;
+    bool GiResolveEnabled = true;
+    int  CascadeIndex     = 0;
+    int  SliceZ           = 0;
 };
 
 void DrawDebugPanel(RS::GBufferPreviewSettings& preview,
@@ -183,6 +184,9 @@ void DrawDebugPanel(RS::GBufferPreviewSettings& preview,
             rcDebug.SliceZ = std::clamp(rcDebug.SliceZ, 0, maxSlice);
 
             ImGui::Checkbox("Build RC atlas", &rcDebug.BuildEnabled);
+            ImGui::BeginDisabled(!rcDebug.BuildEnabled);
+            ImGui::Checkbox("RC GI in lighting", &rcDebug.GiResolveEnabled);
+            ImGui::EndDisabled();
             ImGui::Checkbox("Show RC atlas slice", &rcDebug.ShowDebugSlice);
             ImGui::BeginDisabled(!rcDebug.ShowDebugSlice);
             if (ImGui::SliderInt("Cascade", &rcDebug.CascadeIndex, 0, maxCascade)) {
@@ -434,6 +438,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
                                     "Artifacts/Shaders")) {
         RS_LOG_ERROR("LightingPassInitialize failed");
         return 10;
+    }
+
+    // Phase 3: hand the lighting compose the C0 atlas + the resolve-metadata UBO
+    // ring so it can sample radiance cascades for diffuse GI. Safe only when RC
+    // allocation succeeded; bindings 11/12 stay unwritten otherwise (the shader
+    // reads them only when the resolve-enabled flag in the UBO is set, but we
+    // still register dummy-free real handles here to keep the set valid).
+    if (rcGiReady) {
+        VkBuffer rcResolveBuffers[RS::VulkanContext::kFramesInFlight] = {};
+        RS::RadianceCascadesEnumerateResolveBuffers(
+            rcGi, rcResolveBuffers, RS::VulkanContext::kFramesInFlight);
+        RS::LightingPassRegisterRadianceCascades(
+            lighting, vk, rcGi.Atlases[0].View, rcResolveBuffers);
     }
 
     RS::TonemapPass tonemap;
@@ -831,6 +848,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         // ring is current, then merge cascades C-2..0. Leaves all atlases in
         // GENERAL (debug blit reads them).
         if (rcGiReady && rcDebug.BuildEnabled) {
+            // RecordMerge writes the resolve UBO from these fields; set them first.
+            rcGi.ResolveEnabled = rcDebug.GiResolveEnabled;
             RS::RadianceCascadesRecordBuild(
                 rcGi, frame.Cmd, frame.FrameSlot,
                 view.EyePositionWorld,

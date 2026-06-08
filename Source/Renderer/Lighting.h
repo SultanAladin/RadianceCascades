@@ -67,6 +67,15 @@ bool LightingPassSetShadowAlgorithm(LightingPass& lp, const VulkanContext& ctx,
                                     const IShadowAlgorithm& newAlgo,
                                     const char* shaderArtifactsDir);
 
+// Phase 3: bind the radiance-cascades C0 atlas (storage image3D, GENERAL) and the
+// per-frame resolve-metadata UBO ring into set=1 bindings 11/12. Rewrites those
+// two bindings across all frame slots under vkDeviceWaitIdle (mirrors the
+// SDFConeShadow SetSDF descriptor-rewrite pattern). Must be called once after
+// LightingPassInitialize and after the cascade atlas + UBO ring exist.
+void LightingPassRegisterRadianceCascades(LightingPass& lp, const VulkanContext& ctx,
+                                          VkImageView cascadeAtlasView,
+                                          const VkBuffer* resolveParamBuffersByFrame);
+
 void LightingPassRecord(LightingPass& lp, const VulkanContext& ctx,
                         VkCommandBuffer cmd, uint32_t frameSlot,
                         const OffscreenTargets& targets,

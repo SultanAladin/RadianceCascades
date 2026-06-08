@@ -93,6 +93,15 @@ struct RcSparseParams {
 };
 static_assert(sizeof(RcSparseParams) == 48, "RcSparseParams must stay 48 bytes (std140, matches sdf_sparse.glsl)");
 
+// std140 UBO consumed by the lighting compose (set 1 binding 12 there). Mirrors
+// CascadeResolveBuf in lighting_sdfcone.comp (3 x vec4/uvec4 = 48 bytes).
+struct RcResolveParams {
+    glm::vec4  CascadeOrigin;     // [m] xyz = snapped C0 region min corner; w = probe pitch C0
+    glm::vec4  CascadeInterval;   // [m] x = IntervalEnd t0; y = hemisphere ray count; zw = pad
+    glm::uvec4 CascadeDims;       // [-] x = octSide C0; y = probeAxis C0; z = atlasWidth C0; w = resolve enabled
+};
+static_assert(sizeof(RcResolveParams) == 48, "RcResolveParams must stay 48 bytes (std140, matches lighting_sdfcone.comp)");
+
 //------------------------------------------------------------------------------------------------------------------------
 //                                                    OWNED RESOURCES
 //------------------------------------------------------------------------------------------------------------------------
@@ -129,6 +138,11 @@ struct RcFrameResources {
     VkDeviceMemory MergeParamsMemory = VK_NULL_HANDLE;
     void*          MergeParamsMapped = nullptr;
     std::array<VkDescriptorSet, kMaxCascades> MergeSets{};              // set 0 (merge UBO + atlas pair per cascade)
+
+    // Resolve pass (Phase 3): C0 metadata UBO read by the lighting compose.
+    VkBuffer       ResolveParamsBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory ResolveParamsMemory = VK_NULL_HANDLE;
+    void*          ResolveParamsMapped = nullptr;
 };
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -161,6 +175,10 @@ struct RadianceCascades {
 
     // Per-frame snapped origins cached by RecordBuild for use by RecordMerge.
     std::array<glm::vec3, kMaxCascades> LastSnappedOrigins{};
+
+    // Phase 3 resolve: written into RcResolveParams each RecordMerge.
+    bool     ResolveEnabled    = false;   // [-] lighting compose samples C0 when true
+    uint32_t ResolveRayCount   = 4;       // [-] hemisphere rays per pixel (1..8)
 
     // Sparse residency snapshot (pushed via RadianceCascadesSetSDF, mirrors SDFConeShadow).
     bool         HasSDF       = false;
@@ -232,6 +250,13 @@ void RadianceCascadesRecordBuild(RadianceCascades& rc,
 void RadianceCascadesRecordMerge(RadianceCascades& rc,
                                  VkCommandBuffer cmd,
                                  uint32_t frameSlot);
+
+// Phase 3: expose the per-frame RcResolveParams UBO ring so the lighting pass
+// can bind it (one buffer per frame slot; whole-buffer range, no dynamic offset).
+// Returns VK_NULL_HANDLE buffers until ConstructAtlases has run.
+void RadianceCascadesEnumerateResolveBuffers(const RadianceCascades& rc,
+                                             VkBuffer* outBuffersByFrame,
+                                             uint32_t bufferCount);
 
 // Debug: blit one Z-slice of a cascade atlas into a destination colour image. Proves
 // the atlas has non-zero texels independent of any merge/compose logic. Note:

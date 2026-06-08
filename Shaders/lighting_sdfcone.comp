@@ -31,6 +31,7 @@ SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)
 
 #include "include/sdf_trace.glsl"
 #include "include/pbr_brdf.glsl"
+#include "include/octahedral.glsl"
 
 SDFTRACE_DEFINE_SPARSE_HELPERS()
 
@@ -48,6 +49,19 @@ layout(set = 1, binding = 7) uniform samplerCube  uPrefilter;
 layout(set = 1, binding = 8) uniform sampler2D    uBrdfLut;
 layout(set = 1, binding = 9, rgba16f) uniform writeonly image2D uLightHDR;
 layout(set = 1, binding = 10) uniform sampler2D   uSpecular;
+
+// ----------------------- set=1 radiance cascades resolve ---------------------
+// 🔴 CRITICAL: C0 atlas is a flattened octahedral tile atlas (A5 layout). It must be
+// read via imageLoad with manual per-tile bilinear — a hardware sampler3D would
+// bleed radiance across unrelated probe tiles.
+layout(set = 1, binding = 11, rgba16f) uniform readonly image3D uCascadeAtlasC0;
+
+layout(std140, set = 1, binding = 12) uniform CascadeResolveBuf
+{
+    vec4  CascadeOrigin;    // [m] xyz = snapped C0 region min corner; w = probe pitch C0
+    vec4  CascadeInterval;  // [m] x = IntervalEnd t0; y = hemisphere ray count; zw = pad
+    uvec4 CascadeDims;      // [-] x = octSide C0; y = probeAxis C0; z = atlasWidth C0; w = resolve enabled
+} uCascade;
 
 // ----------------------- set=2 SDFCone shadow contract -----------------------
 // SDF storage at bindings 0/1/2 declared above. AlgoUbo + xforms below.
@@ -73,6 +87,150 @@ layout(push_constant) uniform Push {
     vec4 IblParams;              // x = on/off, y = intensity, z = prefilter mip count
     vec4 ResAndFlags;            // x = width, y = height
 } pc;
+
+// ----------------------- radiance cascades irradiance resolve ----------------
+// Screen pixels act as "Cascade -1": each pixel traces its own short interval
+// [eps, t0] against the sparse SDF, and only rays that ESCAPE the local geometry
+// fetch far-field radiance from C0. Skipping the fixup trace leaks light
+// through walls because the probe grid does not align with real surfaces.
+
+// Bilinearly fetch one C0 probe's octahedral tile (manual, tile-clamped).
+// Mirrors FetchUpperRadiance in rc_merge.comp byte-for-byte in math.
+vec3 FetchCascadeProbeRadiance(uvec3 ProbeIndex, vec3 SampleDirection)
+{
+    const int   OctSide      = int(uCascade.CascadeDims.x);   // [-]  oct tile side C0
+    const float OctSideFloat = float(OctSide);
+
+    vec2 OctUv         = OctEncode(SampleDirection);           // [0-1] direction -> oct UV
+    vec2 TileTexel     = OctUv * OctSideFloat;                 // [px]  float tile-local coords
+
+    // 📝 Clamp the 2x2 kernel so the high texel never leaves this probe's tile.
+    ivec2 TexelLow     = clamp(ivec2(floor(TileTexel - 0.5)), ivec2(0), ivec2(OctSide - 2));
+    ivec2 TexelHigh    = TexelLow + ivec2(1);
+    vec2  BilinearFrac = clamp(TileTexel - 0.5 - vec2(TexelLow), vec2(0.0), vec2(1.0));
+
+    int BaseX = int(ProbeIndex.x) * OctSide;                   // [px] atlas X base (A5)
+    int BaseY = int(ProbeIndex.y) * OctSide;                   // [px] atlas Y base (A5)
+    int BaseZ = int(ProbeIndex.z);                             // [px] bare probe depth
+
+    vec3 Corner00 = imageLoad(uCascadeAtlasC0, ivec3(BaseX + TexelLow.x,  BaseY + TexelLow.y,  BaseZ)).rgb;
+    vec3 Corner10 = imageLoad(uCascadeAtlasC0, ivec3(BaseX + TexelHigh.x, BaseY + TexelLow.y,  BaseZ)).rgb;
+    vec3 Corner01 = imageLoad(uCascadeAtlasC0, ivec3(BaseX + TexelLow.x,  BaseY + TexelHigh.y, BaseZ)).rgb;
+    vec3 Corner11 = imageLoad(uCascadeAtlasC0, ivec3(BaseX + TexelHigh.x, BaseY + TexelHigh.y, BaseZ)).rgb;
+
+    return mix(mix(Corner00, Corner10, BilinearFrac.x),
+               mix(Corner01, Corner11, BilinearFrac.x), BilinearFrac.y);
+}
+
+// Software trilinear parallax gather of C0 at a world-space ray endpoint.
+// Treats C0 as the "upper" cascade exactly as rc_merge.comp does between levels.
+vec3 IntegrateCascadeRadiance(vec3 IntervalEndWorld)
+{
+    const float ProbePitch     = uCascade.CascadeOrigin.w;                    // [m]
+    const vec3  RegionOrigin   = uCascade.CascadeOrigin.xyz;                  // [m]
+    const int   ProbeAxisCount = int(uCascade.CascadeDims.y);                 // [-]
+
+    // Continuous probe-grid index (probe centres sit at integer index + 0.5).
+    const vec3  GridPosition = (IntervalEndWorld - RegionOrigin) / ProbePitch - 0.5;
+    const ivec3 CellLow      = clamp(ivec3(floor(GridPosition)), ivec3(0), ivec3(ProbeAxisCount - 1));
+    const ivec3 CellHigh     = min(CellLow + ivec3(1),           ivec3(ProbeAxisCount - 1));
+    const vec3  CellFrac     = clamp(GridPosition - vec3(CellLow), vec3(0.0), vec3(1.0));
+
+    vec3 GatheredRadiance = vec3(0.0);
+
+    for (int CornerIndex = 0; CornerIndex < 8; ++CornerIndex)
+    {
+        const int ProbeX = ((CornerIndex & 1)        == 0) ? CellLow.x : CellHigh.x;
+        const int ProbeY = (((CornerIndex >> 1) & 1) == 0) ? CellLow.y : CellHigh.y;
+        const int ProbeZ = (((CornerIndex >> 2) & 1) == 0) ? CellLow.z : CellHigh.z;
+
+        const vec3 ProbeCentreWorld = RegionOrigin + (vec3(ProbeX, ProbeY, ProbeZ) + 0.5) * ProbePitch;
+        const vec3 ParallaxDir      = normalize(IntervalEndWorld - ProbeCentreWorld);
+
+        const float WeightX = ((CornerIndex & 1)        == 0) ? (1.0 - CellFrac.x) : CellFrac.x;
+        const float WeightY = (((CornerIndex >> 1) & 1) == 0) ? (1.0 - CellFrac.y) : CellFrac.y;
+        const float WeightZ = (((CornerIndex >> 2) & 1) == 0) ? (1.0 - CellFrac.z) : CellFrac.z;
+
+        GatheredRadiance += FetchCascadeProbeRadiance(uvec3(ProbeX, ProbeY, ProbeZ), ParallaxDir)
+                          * (WeightX * WeightY * WeightZ);
+    }
+
+    return GatheredRadiance;
+}
+
+// Cosine-weighted hemisphere irradiance from C0 with per-ray SDF fixup trace.
+// Returns diffuse GI already multiplied by albedo. With cosine importance
+// sampling the arithmetic mean of fetched radiance IS E/PI, so albedo * mean
+// is the full Lambertian term (no extra 1/PI).
+vec3 ResolveCascadeIrradiance(vec3 WorldPosition, vec3 NormalWorld, vec3 SurfaceAlbedo, uvec2 PixelCoordinate)
+{
+    const float IntervalEnd = uCascade.CascadeInterval.x;                     // [m] t0
+    const int   RayCount    = int(clamp(uCascade.CascadeInterval.y, 1.0, 8.0));
+
+    // 📝 Interleaved gradient noise decorrelates the fixed ray set per pixel.
+    const float GradientNoise = fract(52.9829189 *
+        fract(0.06711056 * float(PixelCoordinate.x) + 0.00583715 * float(PixelCoordinate.y)));
+    const float RotationAngle = GradientNoise * 6.2831853;                    // [rad]
+    const float RotSin        = sin(RotationAngle);
+    const float RotCos        = cos(RotationAngle);
+
+    // Tangent basis around the surface normal.
+    const vec3 BasisUp      = (abs(NormalWorld.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    const vec3 BasisTangent = normalize(cross(BasisUp, NormalWorld));
+    const vec3 BasisBitan   = cross(NormalWorld, BasisTangent);
+
+    const float SurfaceEpsilon = 0.02;                                        // [m] self-hit guard
+    const vec3  RayOriginWorld = WorldPosition + NormalWorld * SurfaceEpsilon;
+
+    vec3 RadianceSum = vec3(0.0);
+
+    for (int RayIndex = 0; RayIndex < RayCount; ++RayIndex)
+    {
+        // ① Cosine-weighted direction from a rotated Fibonacci-style 2D point.
+        const float SampleU   = (float(RayIndex) + 0.5) / float(RayCount);
+        const float SampleV   = fract(float(RayIndex) * 0.618034 + GradientNoise);
+        const float Azimuth   = 6.2831853 * SampleV;                          // [rad]
+        const float CosTheta  = sqrt(1.0 - SampleU);
+        const float SinTheta  = sqrt(SampleU);
+        const vec2  DiskPoint = vec2(cos(Azimuth) * RotCos - sin(Azimuth) * RotSin,
+                                     cos(Azimuth) * RotSin + sin(Azimuth) * RotCos) * SinTheta;
+        const vec3  RayDirWorld = normalize(BasisTangent * DiskPoint.x +
+                                            BasisBitan   * DiskPoint.y +
+                                            NormalWorld  * CosTheta);
+
+        // ② Fixup trace: march EXACTLY the C0 interval through every SDF instance.
+        bool RayOccluded = false;
+        const uint InstanceCount = min(uXforms.sdfInstanceCount, 256u);
+        for (uint InstanceIndex = 0u; InstanceIndex < InstanceCount && !RayOccluded; ++InstanceIndex)
+        {
+            const mat4  InverseModel       = uXforms.sdfInvModels[InstanceIndex];
+            const vec3  OriginLocal        = (InverseModel * vec4(RayOriginWorld, 1.0)).xyz;
+            const vec3  DirectionLocalRaw  = mat3(InverseModel) * RayDirWorld;
+            const float ScaleLocalPerWorld = length(DirectionLocalRaw);
+            const vec3  DirectionLocal     = DirectionLocalRaw / max(ScaleLocalPerWorld, 1e-6);
+
+            vec3  HitPositionLocal;
+            vec3  HitNormalLocal;
+            float DistanceTravelledLocal;
+            RayOccluded = SDF_TraceHitSparse(
+                OriginLocal, DirectionLocal,
+                SurfaceEpsilon * ScaleLocalPerWorld,
+                IntervalEnd   * ScaleLocalPerWorld,
+                48, max(0.01 * ScaleLocalPerWorld, 1e-4),
+                uSparseP.P,
+                HitPositionLocal, HitNormalLocal, DistanceTravelledLocal);
+        }
+
+        // ③ Escaped rays fetch far-field radiance from C0 at the interval end.
+        if (!RayOccluded)
+        {
+            const vec3 IntervalEndWorld = WorldPosition + RayDirWorld * IntervalEnd;
+            RadianceSum += IntegrateCascadeRadiance(IntervalEndWorld);
+        }
+    }
+
+    return SurfaceAlbedo * (RadianceSum / float(RayCount));
+}
 
 // ----------------------- main ------------------------------------------------
 
@@ -199,6 +357,12 @@ void main() {
     }
     ambient *= ao;
 
-    vec3 result = lit + ambient + emiss;
+    // Radiance-cascades diffuse GI (additive alongside IBL; in-app toggle).
+    vec3 cascadeGI = vec3(0.0);
+    if (uCascade.CascadeDims.w != 0u) {
+        cascadeGI = ResolveCascadeIrradiance(worldPos, N, albedo, uvec2(px)) * ao;
+    }
+
+    vec3 result = lit + ambient + cascadeGI + emiss;
     imageStore(uLightHDR, px, vec4(result, 1.0));
 }

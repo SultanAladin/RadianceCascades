@@ -17,6 +17,11 @@ namespace {
 constexpr uint32_t kFrameBindingCount = 11;   // 0..10 (GBuffer + IBL + LightHDR + Specular)
 constexpr uint32_t kLightHDRBinding   = 9;
 constexpr uint32_t kSpecularBinding   = 10;
+// Phase 3 radiance-cascades resolve: C0 atlas (storage image) + metadata UBO.
+// These two are distinct descriptor types from the GBuffer block above, so they
+// are declared/written separately rather than folded into the image loop.
+constexpr uint32_t kCascadeAtlasBinding  = 11;
+constexpr uint32_t kCascadeResolveBinding = 12;
 
 bool ReadFile(const char* path, std::vector<char>& out) {
     FILE* f = std::fopen(path, "rb");
@@ -46,7 +51,7 @@ VkShaderModule LoadModule(VkDevice device, const char* path) {
 }
 
 bool CreateFrameSetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
-    VkDescriptorSetLayoutBinding b[kFrameBindingCount]{};
+    VkDescriptorSetLayoutBinding b[kFrameBindingCount + 2]{};
     // 0..5 GBuffer SRVs (combined image samplers)
     for (uint32_t i = 0; i < 6; ++i) {
         b[i].binding         = i;
@@ -71,9 +76,19 @@ bool CreateFrameSetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
     b[10].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     b[10].descriptorCount = 1;
     b[10].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    // 11 Cascade C0 atlas (storage image, read-only in shader)
+    b[11].binding         = kCascadeAtlasBinding;
+    b[11].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[11].descriptorCount = 1;
+    b[11].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    // 12 Cascade resolve metadata (uniform buffer)
+    b[12].binding         = kCascadeResolveBinding;
+    b[12].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[12].descriptorCount = 1;
+    b[12].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    lci.bindingCount = kFrameBindingCount;
+    lci.bindingCount = kFrameBindingCount + 2;
     lci.pBindings    = b;
     return vkCreateDescriptorSetLayout(device, &lci, nullptr, &outLayout) == VK_SUCCESS;
 }
@@ -85,15 +100,17 @@ bool CreateEmptySetLayout(VkDevice device, VkDescriptorSetLayout& outLayout) {
 }
 
 bool CreateDescriptorPool(VkDevice device, VkDescriptorPool& outPool) {
-    VkDescriptorPoolSize sizes[2]{};
+    VkDescriptorPoolSize sizes[3]{};
     sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[0].descriptorCount = 10 * VulkanContext::kFramesInFlight; // 9 + Specular
     sizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    sizes[1].descriptorCount = 1  * VulkanContext::kFramesInFlight;
+    sizes[1].descriptorCount = 2  * VulkanContext::kFramesInFlight; // LightHDR + C0 atlas
+    sizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sizes[2].descriptorCount = 1  * VulkanContext::kFramesInFlight; // cascade resolve UBO
 
     VkDescriptorPoolCreateInfo pci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     pci.maxSets       = VulkanContext::kFramesInFlight + 1;    // +1 for unused set=0
-    pci.poolSizeCount = 2;
+    pci.poolSizeCount = 3;
     pci.pPoolSizes    = sizes;
     return vkCreateDescriptorPool(device, &pci, nullptr, &outPool) == VK_SUCCESS;
 }
@@ -300,6 +317,44 @@ bool LightingPassSetShadowAlgorithm(LightingPass& lp, const VulkanContext& ctx,
     lp.BuiltShadowLayout = newLayout;
     RS_LOG_INFO("LightingPass rebuilt: variant=%u", newVariant);
     return true;
+}
+
+void LightingPassRegisterRadianceCascades(LightingPass& lp, const VulkanContext& ctx,
+                                          VkImageView cascadeAtlasView,
+                                          const VkBuffer* resolveParamBuffersByFrame) {
+    if (!lp.Initialized || cascadeAtlasView == VK_NULL_HANDLE || !resolveParamBuffersByFrame)
+        return;
+
+    vkDeviceWaitIdle(ctx.Device);
+
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        VkDescriptorImageInfo atlasInfo{};
+        atlasInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;       // C0 stays GENERAL (compute store + read)
+        atlasInfo.imageView   = cascadeAtlasView;
+        atlasInfo.sampler     = VK_NULL_HANDLE;                // storage image, sampler ignored
+
+        VkDescriptorBufferInfo resolveInfo{};
+        resolveInfo.buffer = resolveParamBuffersByFrame[i];
+        resolveInfo.offset = 0;
+        resolveInfo.range  = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet          = lp.FrameSets[i];
+        writes[0].dstBinding      = kCascadeAtlasBinding;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo      = &atlasInfo;
+
+        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet          = lp.FrameSets[i];
+        writes[1].dstBinding      = kCascadeResolveBinding;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[1].pBufferInfo     = &resolveInfo;
+
+        vkUpdateDescriptorSets(ctx.Device, 2, writes, 0, nullptr);
+    }
 }
 
 void LightingPassRecord(LightingPass& lp, const VulkanContext& /*ctx*/,
