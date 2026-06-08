@@ -200,6 +200,14 @@ struct RadianceCascades {
     std::array<VkBuffer, VulkanContext::kFramesInFlight> InstXformBuffers{};
     VkDeviceSize InstXformBytes = 0;
 
+    // Per-instance base-colour SSBO ring (owned by RC). albedo[i] pairs with
+    // InvModel[i] in the xform ring; the build shades its nearest-hit instance with
+    // this colour to produce GI colour bleed. uint count header + vec4[256], mirroring
+    // the xform buffer's header layout so the shader can share the SdfInstanceCount.
+    std::array<VkBuffer, VulkanContext::kFramesInFlight>       InstAlbedoBuffers{};
+    std::array<VkDeviceMemory, VulkanContext::kFramesInFlight> InstAlbedoMemories{};
+    std::array<void*, VulkanContext::kFramesInFlight>          InstAlbedoMapped{};
+
     const VulkanContext* Ctx = nullptr;
 };
 
@@ -232,6 +240,13 @@ void RadianceCascadesSetSDF(RadianceCascades& rc, const ResidentSparseSDF* spars
 void RadianceCascadesSetInstanceXformBuffer(RadianceCascades& rc,
                                             const VkBuffer* ssbosByFrame,
                                             VkDeviceSize bytesPerSlot);
+
+// Upload per-instance base colours for GI colour bleed. `colours[i]` must align with
+// the InvModel[i] packed by InstanceXformBufferRefresh (live instances of the SDF mesh).
+// Writes only the current-frame-agnostic mapped ring (all slots); cheap, called per frame.
+void RadianceCascadesSetInstanceAlbedos(RadianceCascades& rc,
+                                        const glm::vec4* colours,
+                                        uint32_t count);
 
 // Record pass 1 for the active frame: fill UBOs from camera/sun, dispatch rc_build
 // once per cascade (flattened-atlas grid), then a write->read barrier so a later

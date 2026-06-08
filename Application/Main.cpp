@@ -508,6 +508,24 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
     RebuildShaderBallGrid(scene, gridSlots, gridCurrentN, /*requested*/ 3,
                           shaderBall, aabbMin, aabbMax, /*forceReseed*/ false);
 
+    // Bind a varied colour palette to the grid balls. RebuildShaderBallGrid only
+    // inscribes geometry (MaterialBindings default to handle 0 = no colour), so
+    // without this the SDF-traced GI sees every ball as the white fallback and the
+    // indirect light shows no colour bleed. Distinct neighbours let colour bleed read.
+    {
+        const RS::MaterialHandle palette[] = {
+            seeded.RedPlastic, seeded.PolishedGold, seeded.BrushedAluminium,
+            seeded.MatteBlackRubber, seeded.EmissiveCyan, seeded.Default
+        };
+        const size_t paletteCount = sizeof(palette) / sizeof(palette[0]);
+        for (size_t i = 0; i < gridSlots.size(); ++i) {
+            const RS::InstanceHandle h = gridSlots[i];
+            if (h == 0) continue;
+            const RS::MaterialHandle mat = palette[i % paletteCount];
+            if (mat != 0) scene.BindMaterial(h, 0, mat);
+        }
+    }
+
     // Phase 11.5 â€” vast checker floor as a real GBuffer mesh. Shadows from any
     // SDF cone shadows sample it through the GBuffer like the other scene geometry.
     RS::FloorPlaneDesc floorDesc{};
@@ -850,11 +868,28 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/,
         if (rcGiReady && rcDebug.BuildEnabled) {
             // RecordMerge writes the resolve UBO from these fields; set them first.
             rcGi.ResolveEnabled = rcDebug.GiResolveEnabled;
+
+            // Per-instance base colours for GI colour bleed. MUST be packed in the
+            // SAME order InstanceXformBufferRefresh packs sdfInvModels (live instances
+            // whose Mesh == activeSdfMesh), so albedo[i] lines up with invModel[i].
+            glm::vec4 sdfAlbedos[256];
+            uint32_t  sdfAlbedoCount = 0;
+            RS::SceneInstances(scene).ForEach(
+                [&](RS::InstanceHandle, const RS::GpuInstance& inst) {
+                    if (inst.Mesh == activeSdfMesh && sdfAlbedoCount < 256u) {
+                        glm::vec3 base(0.8f);
+                        if (!inst.MaterialBindings.empty() && inst.MaterialBindings[0] != 0)
+                            base = materials.Get(inst.MaterialBindings[0]).AlbedoFlat;
+                        sdfAlbedos[sdfAlbedoCount++] = glm::vec4(base, 0.0f);
+                    }
+                });
+            RS::RadianceCascadesSetInstanceAlbedos(rcGi, sdfAlbedos, sdfAlbedoCount);
+
             RS::RadianceCascadesRecordBuild(
                 rcGi, frame.Cmd, frame.FrameSlot,
                 view.EyePositionWorld,
                 previewSettings.SunDirection,
-                glm::vec3(previewSettings.SunIntensity));
+                skySettings.SunColor * previewSettings.SunIntensity);
             RS::RadianceCascadesRecordMerge(rcGi, frame.Cmd, frame.FrameSlot);
         }
 

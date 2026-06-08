@@ -44,6 +44,15 @@ layout(std430, set = 0, binding = 3) readonly buffer InstanceXforms {
     mat4 SdfInvModels[256];
 } uXforms;
 
+// --- set 0 binding 4: per-instance base colour for GI colour bleed (RC-owned ring). ---
+// SdfAlbedos[i] pairs with SdfInvModels[i]; the build shades its nearest-hit instance
+// with this colour. Header (count + pad) mirrors the xform buffer for index alignment.
+layout(std430, set = 0, binding = 4) readonly buffer InstanceAlbedos {
+    uint AlbedoCount;
+    uint AlbedoPad0, AlbedoPad1, AlbedoPad2;
+    vec4 SdfAlbedos[256];
+} uAlbedos;
+
 SDFSPARSE_DEFINE_HELPER    (uSparseIdx, uSparsePool)   // SDFSparseSampleHelper    (point sampler)
 SDFSPARSE_DEFINE_RAY_HELPER(uSparseIdx, uSparsePool)   // SDFSparseRaySampleHelper (brick-skip ray sampler)
 
@@ -133,51 +142,78 @@ void main()
     // Octahedral direction (world space) for this texel centre.
     const vec3 DirectionWorld = DirectionFromOctTexel(int(DirectionX), int(DirectionY), int(OctSide));
 
-    // World -> mesh-local (mirrors lighting_sdfcone.comp). invModel rotates+scales into baked cm space.
-    const uint InstanceIndex   = uCascade.C.GridDims.w;
-    const mat4 InvModel        = uXforms.SdfInvModels[InstanceIndex];
+    // Loop EVERY resident SDF instance and keep the world-distance nearest hit, so a probe
+    // interval that lands on the red ball injects red radiance, the yellow ball yellow, etc.
+    // (single-instance tracing produced one flat colour with no spatial colour bleed).
+    // Each instance has its own world->local scale, so hit distances are normalised to world
+    // metres (DistanceTravelledLocal / ScaleLocalPerWorld) before comparing across instances.
+    const uint  InstanceCount = min(uXforms.SdfInstanceCount, 256u);
 
-    const vec3  RayOriginLocal     = (InvModel * vec4(ProbeWorld, 1.0)).xyz;
-    const vec3  DirectionLocalRaw  = mat3(InvModel) * DirectionWorld;          // not yet unit
-    const float ScaleLocalPerWorld = length(DirectionLocalRaw);                // ~100 for ShaderBall
-    const vec3  DirectionLocal     = DirectionLocalRaw / max(ScaleLocalPerWorld, 1e-6);
+    bool  SurfaceHit       = false;
+    float NearestWorldDist = 1e30;
+    vec3  HitNormalWorld   = vec3(0.0, 1.0, 0.0);
+    uint  HitInstance      = 0u;
 
-    // Interval [start,end] metres -> local units. This cascade only marches ITS disjoint slice.
-    const float IntervalStartLocal = uCascade.C.IntervalMetres.x * ScaleLocalPerWorld;
-    const float IntervalEndLocal   = uCascade.C.IntervalMetres.y * ScaleLocalPerWorld;
-    const float MinStepLocal       = max(uCascade.C.IntervalMetres.z * ScaleLocalPerWorld, 1e-4);
+    for (uint InstanceIndex = 0u; InstanceIndex < InstanceCount; ++InstanceIndex)
+    {
+        const mat4  InvModel           = uXforms.SdfInvModels[InstanceIndex];
+        const vec3  RayOriginLocal     = (InvModel * vec4(ProbeWorld, 1.0)).xyz;
+        const vec3  DirectionLocalRaw  = mat3(InvModel) * DirectionWorld;       // not yet unit
+        const float ScaleLocalPerWorld = length(DirectionLocalRaw);            // ~100 for ShaderBall
+        const vec3  DirectionLocal     = DirectionLocalRaw / max(ScaleLocalPerWorld, 1e-6);
 
-    // Trace the disjoint interval through the sparse SDF. SDF_TraceHitSparse advances by the RAY helper and
-    // hit-tests/normals via the POINT helper — the correct split, already audited.
-    vec3  HitPositionLocal;
-    vec3  HitNormalLocal;
-    float DistanceTravelledLocal;
+        // Interval [start,end] metres -> this instance's local units.
+        const float IntervalStartLocal = uCascade.C.IntervalMetres.x * ScaleLocalPerWorld;
+        const float IntervalEndLocal   = uCascade.C.IntervalMetres.y * ScaleLocalPerWorld;
+        const float MinStepLocal       = max(uCascade.C.IntervalMetres.z * ScaleLocalPerWorld, 1e-4);
 
-    const bool SurfaceHit = SDF_TraceHitSparse(
-        RayOriginLocal, DirectionLocal,
-        IntervalStartLocal, IntervalEndLocal,
-        MaxTraceSteps, MinStepLocal,
-        uSparseP.P,
-        HitPositionLocal, HitNormalLocal, DistanceTravelledLocal);
+        vec3  HitPositionLocal;
+        vec3  HitNormalLocal;
+        float DistanceTravelledLocal;
 
-    // Shade. Minimal but instrumented: hit -> sun*NdotL*albedo + ambient, transmittance 0; miss -> ambient*0, T=1.
+        const bool Hit = SDF_TraceHitSparse(
+            RayOriginLocal, DirectionLocal,
+            IntervalStartLocal, IntervalEndLocal,
+            MaxTraceSteps, MinStepLocal,
+            uSparseP.P,
+            HitPositionLocal, HitNormalLocal, DistanceTravelledLocal);
+
+        if (Hit)
+        {
+            const float WorldDist = DistanceTravelledLocal / max(ScaleLocalPerWorld, 1e-6);
+            if (WorldDist < NearestWorldDist)
+            {
+                NearestWorldDist = WorldDist;
+                // local->world for a direction is the inverse-transpose of world->local = transpose(mat3(InvModel)).
+                HitNormalWorld   = normalize(transpose(mat3(InvModel)) * HitNormalLocal);
+                HitInstance      = InstanceIndex;
+                SurfaceHit       = true;
+            }
+        }
+    }
+
+    // Shade the winning hit: sun*NdotL*albedo + sky-fill ambient, all times 1/PI; miss -> T=1.
     vec3  Radiance     = vec3(0.0);
     float Transmittance = 1.0;
 
     if (SurfaceHit)
     {
-        // Normal is in mesh-local space; transform back to world for the sun dot. mat3(InvModel) maps world->local,
-        // so its transpose maps local->world for a direction (ignoring non-uniform scale, fine for a unit normal).
-        const vec3 NormalWorld = normalize(transpose(mat3(InvModel)) * HitNormalLocal);
-
         const vec3  SunDir = normalize(uLight.SunDirectionWorld.xyz);
-        const float NdotL  = max(dot(NormalWorld, SunDir), 0.0);
+        const float NdotL  = max(dot(HitNormalWorld, SunDir), 0.0);
 
-        // No self-visibility cone here (that's a later refinement); direct hit assumes lit. vis = 1.
-        const vec3 DirectTerm = uLight.SunColour.rgb * NdotL * uLight.SurfaceAlbedo.rgb;
-        const vec3 AmbientTerm = uLight.AmbientColour.rgb * uCascade.C.IntervalMetres.w * uLight.SurfaceAlbedo.rgb;
+        // Per-instance base colour drives colour bleed. Fall back to the UBO constant if the
+        // albedo ring is short (count mismatch) so a hit never goes black.
+        const vec3 SurfaceAlbedo = (HitInstance < uAlbedos.AlbedoCount)
+            ? uAlbedos.SdfAlbedos[HitInstance].rgb
+            : uLight.SurfaceAlbedo.rgb;
 
-        Radiance      = DirectTerm + AmbientTerm;
+        // Lambertian: outgoing RADIANCE = albedo * irradiance / PI. The cascade stores radiance
+        // (the resolve pass consumes it as radiance), so the 1/PI must be applied here, not omitted.
+        const float kInvPI = 0.31830988618;
+        const vec3 DirectTerm  = uLight.SunColour.rgb * NdotL * SurfaceAlbedo;
+        const vec3 AmbientTerm = uLight.AmbientColour.rgb * uCascade.C.IntervalMetres.w * SurfaceAlbedo;
+
+        Radiance      = (DirectTerm + AmbientTerm) * kInvPI;
         Transmittance = 0.0;   // opaque hit fully occludes the far interval for the merge composite
     }
     else

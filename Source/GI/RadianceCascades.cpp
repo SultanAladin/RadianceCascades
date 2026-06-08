@@ -89,15 +89,16 @@ static void ResolveLevels(RadianceCascades& rc) {
 static bool CreateSetLayouts(RadianceCascades& rc) {
     VkDevice device = rc.Ctx->Device;
 
-    // set 0: sparse SDF (idx, pool, params, instance-xform).
-    VkDescriptorSetLayoutBinding sparse[4]{};
+    // set 0: sparse SDF (idx, pool, params, instance-xform) + per-instance albedo (binding 4).
+    VkDescriptorSetLayoutBinding sparse[5]{};
     sparse[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     sparse[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     sparse[2] = { 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
     sparse[3] = { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+    sparse[4] = { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
     VkDescriptorSetLayoutCreateInfo sci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    sci.bindingCount = 4;
+    sci.bindingCount = 5;
     sci.pBindings    = sparse;
     if (vkCreateDescriptorSetLayout(device, &sci, nullptr, &rc.SetLayoutSparse) != VK_SUCCESS) return false;
 
@@ -174,6 +175,17 @@ static bool CreateUboRings(RadianceCascades& rc) {
                               frame.ResolveParamsBuffer, frame.ResolveParamsMemory, &frame.ResolveParamsMapped))
             return false;
     }
+
+    // Per-instance albedo SSBO ring (header: uint count + 3 pad, then vec4[256]).
+    // Mirrors the InstanceXform buffer's header so the shader shares SdfInstanceCount.
+    const VkDeviceSize albedoBytes = 16 + 256 * sizeof(glm::vec4);
+    const uint32_t fic = VulkanContext::kFramesInFlight;
+    for (uint32_t i = 0; i < fic; ++i) {
+        if (!CreateHostBuffer(*rc.Ctx, albedoBytes,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                              rc.InstAlbedoBuffers[i], rc.InstAlbedoMemories[i], &rc.InstAlbedoMapped[i]))
+            return false;
+    }
     return true;
 }
 
@@ -184,7 +196,7 @@ static bool CreateDescriptorPoolAndSets(RadianceCascades& rc) {
     // Per frame: set 0 (2 SSBO idx/pool + 1 SSBO xform + 1 UBO params) + set 1 x kMaxCascades (2 UBO + 1 image).
     // Pool sizes include merge sets: +kMaxCascades UBOs (merge params) and +2*kMaxCascades storage images (N + upper).
     VkDescriptorPoolSize sizes[3]{};
-    sizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, frames * 3 };                           // idx + pool + xform
+    sizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, frames * 4 };                           // idx + pool + xform + albedo
     sizes[1] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, frames * (1 + 3 * kMaxCascades) };      // sparse params + build/lighting + merge per cascade
     sizes[2] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  frames * 3 * kMaxCascades };            // build atlas + merge (N + upper) per cascade
 
@@ -490,7 +502,7 @@ static void RewriteSparseSets(RadianceCascades& rc) {
         poolInfo.offset = 0;
         poolInfo.range  = (rc.HasSDF && rc.PoolBuffer) ? rc.PoolBytes : 16;
 
-        VkWriteDescriptorSet writes[3]{};
+        VkWriteDescriptorSet writes[4]{};
         uint32_t n = 0;
         writes[n++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.SparseSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &idxInfo,  nullptr };
         writes[n++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.SparseSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &poolInfo, nullptr };
@@ -509,6 +521,13 @@ static void RewriteSparseSets(RadianceCascades& rc) {
             xformInfo.range  = 16;
             writes[n++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.SparseSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &xformInfo, nullptr };
         }
+
+        // Binding 4: per-instance albedo SSBO (RC-owned ring, always valid post-CreateUboRings).
+        VkDescriptorBufferInfo albedoInfo{};
+        albedoInfo.buffer = (rc.InstAlbedoBuffers[slot] != VK_NULL_HANDLE) ? rc.InstAlbedoBuffers[slot] : rc.DummyBuffer;
+        albedoInfo.offset = 0;
+        albedoInfo.range  = (rc.InstAlbedoBuffers[slot] != VK_NULL_HANDLE) ? (16 + 256 * sizeof(glm::vec4)) : 16;
+        writes[n++] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, frame.SparseSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &albedoInfo, nullptr };
 
         vkUpdateDescriptorSets(rc.Ctx->Device, n, writes, 0, nullptr);
     }
@@ -557,6 +576,22 @@ void RadianceCascadesSetInstanceXformBuffer(RadianceCascades& rc,
     RewriteSparseSets(rc);
 }
 
+void RadianceCascadesSetInstanceAlbedos(RadianceCascades& rc,
+                                        const glm::vec4* colours,
+                                        uint32_t count) {
+    const uint32_t clamped = (count > 256u) ? 256u : count;
+    // Layout: { uint count; uint pad[3]; vec4 albedo[256]; }. Write all frame slots —
+    // host-coherent, so the value is visible to whichever slot the build records next.
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        void* mapped = rc.InstAlbedoMapped[i];
+        if (!mapped) continue;
+        std::memset(mapped, 0, 16);
+        std::memcpy(mapped, &clamped, sizeof(uint32_t));
+        if (clamped > 0 && colours)
+            std::memcpy(static_cast<char*>(mapped) + 16, colours, clamped * sizeof(glm::vec4));
+    }
+}
+
 //------------------------------------------------------------------------------------------------------------------------
 //                                                    RECORD BUILD
 //------------------------------------------------------------------------------------------------------------------------
@@ -573,8 +608,11 @@ void RadianceCascadesRecordBuild(RadianceCascades& rc,
     RcLightingParams lighting{};
     lighting.SunDirectionWorld = glm::vec4(glm::normalize(sunDirectionWorld), 0.0f);
     lighting.SunColour         = glm::vec4(sunColour, 0.0f);
-    lighting.AmbientColour     = glm::vec4(0.03f, 0.035f, 0.045f, 0.0f);   // faint sky ambient; tune later
-    lighting.SurfaceAlbedo     = glm::vec4(0.8f, 0.8f, 0.8f, 0.0f);        // placeholder constant albedo
+    // Sky-fill ambient is a small fraction of the sun radiance, NOT a constant. This
+    // keeps a faint daytime fill but makes GI fade to black as the sun sets — a constant
+    // floor here is what made the GI glow with the sun fully down.
+    lighting.AmbientColour     = glm::vec4(sunColour * 0.05f, 0.0f);
+    lighting.SurfaceAlbedo     = glm::vec4(0.8f, 0.8f, 0.8f, 0.0f);        // fallback; per-instance albedo overrides in the build
     std::memcpy(frame.LightingMapped, &lighting, sizeof(RcLightingParams));
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rc.BuildPipeline);
@@ -785,6 +823,15 @@ void RadianceCascadesTerminate(RadianceCascades& rc, const VulkanContext& ctx) {
         if (frame.ResolveParamsBuffer) vkDestroyBuffer(device, frame.ResolveParamsBuffer, nullptr);
         if (frame.ResolveParamsMemory) vkFreeMemory(device, frame.ResolveParamsMemory, nullptr);
         frame = RcFrameResources{};
+    }
+
+    for (uint32_t i = 0; i < VulkanContext::kFramesInFlight; ++i) {
+        if (rc.InstAlbedoMapped[i])   vkUnmapMemory(device, rc.InstAlbedoMemories[i]);
+        if (rc.InstAlbedoBuffers[i])  vkDestroyBuffer(device, rc.InstAlbedoBuffers[i], nullptr);
+        if (rc.InstAlbedoMemories[i]) vkFreeMemory(device, rc.InstAlbedoMemories[i], nullptr);
+        rc.InstAlbedoBuffers[i]  = VK_NULL_HANDLE;
+        rc.InstAlbedoMemories[i] = VK_NULL_HANDLE;
+        rc.InstAlbedoMapped[i]   = nullptr;
     }
 
     if (rc.DummyBuffer)         vkDestroyBuffer(device, rc.DummyBuffer, nullptr);

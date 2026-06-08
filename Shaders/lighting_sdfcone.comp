@@ -122,9 +122,13 @@ vec3 FetchCascadeProbeRadiance(uvec3 ProbeIndex, vec3 SampleDirection)
                mix(Corner01, Corner11, BilinearFrac.x), BilinearFrac.y);
 }
 
-// Software trilinear parallax gather of C0 at a world-space ray endpoint.
-// Treats C0 as the "upper" cascade exactly as rc_merge.comp does between levels.
-vec3 IntegrateCascadeRadiance(vec3 IntervalEndWorld)
+// Software trilinear gather of C0 at a world-space ray endpoint.
+// This is a Monte Carlo hemisphere gather, NOT an inter-cascade merge: each probe
+// tile is queried with the actual ray direction (the direction the radiance travels
+// back along), so the per-pixel rotated ray set drives the angular lookup. Using the
+// probe->endpoint parallax vector here (as rc_merge does for its fixed per-texel
+// direction) would collapse the angular variety and bake in a few geometric lobes.
+vec3 IntegrateCascadeRadiance(vec3 IntervalEndWorld, vec3 RayDirWorld)
 {
     const float ProbePitch     = uCascade.CascadeOrigin.w;                    // [m]
     const vec3  RegionOrigin   = uCascade.CascadeOrigin.xyz;                  // [m]
@@ -144,14 +148,11 @@ vec3 IntegrateCascadeRadiance(vec3 IntervalEndWorld)
         const int ProbeY = (((CornerIndex >> 1) & 1) == 0) ? CellLow.y : CellHigh.y;
         const int ProbeZ = (((CornerIndex >> 2) & 1) == 0) ? CellLow.z : CellHigh.z;
 
-        const vec3 ProbeCentreWorld = RegionOrigin + (vec3(ProbeX, ProbeY, ProbeZ) + 0.5) * ProbePitch;
-        const vec3 ParallaxDir      = normalize(IntervalEndWorld - ProbeCentreWorld);
-
         const float WeightX = ((CornerIndex & 1)        == 0) ? (1.0 - CellFrac.x) : CellFrac.x;
         const float WeightY = (((CornerIndex >> 1) & 1) == 0) ? (1.0 - CellFrac.y) : CellFrac.y;
         const float WeightZ = (((CornerIndex >> 2) & 1) == 0) ? (1.0 - CellFrac.z) : CellFrac.z;
 
-        GatheredRadiance += FetchCascadeProbeRadiance(uvec3(ProbeX, ProbeY, ProbeZ), ParallaxDir)
+        GatheredRadiance += FetchCascadeProbeRadiance(uvec3(ProbeX, ProbeY, ProbeZ), RayDirWorld)
                           * (WeightX * WeightY * WeightZ);
     }
 
@@ -225,7 +226,7 @@ vec3 ResolveCascadeIrradiance(vec3 WorldPosition, vec3 NormalWorld, vec3 Surface
         if (!RayOccluded)
         {
             const vec3 IntervalEndWorld = WorldPosition + RayDirWorld * IntervalEnd;
-            RadianceSum += IntegrateCascadeRadiance(IntervalEndWorld);
+            RadianceSum += IntegrateCascadeRadiance(IntervalEndWorld, RayDirWorld);
         }
     }
 
